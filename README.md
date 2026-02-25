@@ -374,6 +374,33 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Non-streaming semantics:
+- one JSON response (`object: "chat.completion"`)
+- final model output is in `choices[0].message.content`
+- token counts are in `usage`
+
+Python example (non-streaming):
+
+```python
+import requests
+
+payload = {
+    "model": "local-llminfer",
+    "messages": [
+        {"role": "system", "content": "You are concise."},
+        {"role": "user", "content": "Tell me about GPUs in 4 bullet points."},
+    ],
+    "max_tokens": 160,
+    "temperature": 0.2,
+}
+
+resp = requests.post("http://127.0.0.1:8000/v1/chat/completions", json=payload, timeout=180)
+resp.raise_for_status()
+data = resp.json()
+print(data["choices"][0]["message"]["content"])
+print(data["usage"])
+```
+
 Streaming chat request (SSE):
 
 ```bash
@@ -385,6 +412,77 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
     "stream": true
   }'
 ```
+
+Streaming semantics (SSE):
+- chunks arrive as Server-Sent Event lines: `data: {...}`
+- text increments are in `choices[0].delta.content`
+- stream terminates with `data: [DONE]`
+
+Python example (SSE, robust parser):
+
+```python
+import json
+import requests
+
+stream_payload = {
+    "model": "local-llminfer",
+    "messages": [{"role": "user", "content": "Explain KV cache in under 80 words."}],
+    "max_tokens": 120,
+    "temperature": 0.2,
+    "stream": True,
+}
+
+decoder = json.JSONDecoder()
+done = False
+
+with requests.post(
+    "http://127.0.0.1:8000/v1/chat/completions",
+    json=stream_payload,
+    stream=True,
+    timeout=180,
+) as r:
+    r.raise_for_status()
+
+    for raw_line in r.iter_lines(decode_unicode=True):
+        if not raw_line:
+            continue
+        line = raw_line.strip()
+        if "data:" not in line:
+            continue
+
+        # Some transports can coalesce multiple data frames in one line.
+        payloads = [p.strip() for p in line.split("data:") if p.strip()]
+        for payload in payloads:
+            if payload == "[DONE]":
+                done = True
+                break
+
+            # Ignore heartbeat/newline fragments.
+            if payload in {"\\n", "\\n\\n", "\"\\n\"", "\"\\n\\n\""}:
+                continue
+
+            s = payload
+            while s:
+                s = s.lstrip()
+                if not s:
+                    break
+                try:
+                    obj, idx = decoder.raw_decode(s)
+                except json.JSONDecodeError:
+                    break
+                s = s[idx:]
+                delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
+                if delta:
+                    print(delta, end="", flush=True)
+
+        if done:
+            print("\\n[done]")
+            break
+```
+
+This parser pattern is also used in:
+- `examples/llminfer_serving_colab.ipynb`
+- `examples/openai_api_client.py`
 
 Health and metrics:
 
