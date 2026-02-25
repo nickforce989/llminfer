@@ -26,6 +26,11 @@ pip install -e ".[peft]"    # LoRA adapter hot-swap
 
 ---
 
+## Author
+Niccolò Forzano --- [github.com/nickforce989](https://github.com/nickforce989) · [nic.forz@gmail.com](mailto:nic.forz@gmail.com)
+
+---
+
 ## Colab Notebook Guide
 
 - Start with `examples/llminfer_all_examples_colab.ipynb` for a complete guided tour.
