@@ -72,6 +72,21 @@ class CompiledBackend(EagerBackend):
 
         logger.info("Compilation setup done in %.2fs  (first call will trigger JIT)", time.monotonic() - t0)
 
+    def _mark_cudagraph_step(self) -> None:
+        """
+        Mark a new cudagraph step boundary before each compiled invocation.
+
+        This avoids output-buffer reuse issues seen on some torch/transformers
+        combinations in long generation loops.
+        """
+        if not self._compiled:
+            return
+        try:
+            mark_step = torch.compiler.cudagraph_mark_step_begin
+        except AttributeError:
+            return
+        mark_step()
+
     def warmup(self, prompt: str = "Hello world", n: int = 2) -> None:
         """
         Run a few dummy generations to trigger JIT compilation
@@ -88,6 +103,7 @@ class CompiledBackend(EagerBackend):
         logger.info("Warmup complete in %.2fs", time.monotonic() - t0)
 
     def generate(self, requests: List[GenerationRequest]) -> List[GenerationResult]:
+        self._mark_cudagraph_step()
         results = super().generate(requests)
         if self._compiled and not self._warmup_done:
             logger.debug("First compiled inference — JIT tracing occurred.")
@@ -96,4 +112,5 @@ class CompiledBackend(EagerBackend):
     def stream(self, request: GenerationRequest) -> Iterator[StreamChunk]:
         # Streaming with torch.compile works the same way; the compiled
         # forward will be called inside the generate loop.
+        self._mark_cudagraph_step()
         return super().stream(request)

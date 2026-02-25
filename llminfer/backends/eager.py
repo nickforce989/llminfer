@@ -88,7 +88,9 @@ class EagerBackend(BaseBackend):
     def _build_gen_config(self, req: GenerationRequest) -> dict:
         return dict(
             max_new_tokens=req.max_new_tokens,
-            do_sample=req.temperature > 0 and req.temperature != 1.0,
+            # Temperature/top-p/top-k only have an effect when sampling is enabled.
+            # Treat any positive temperature as sampling mode (temperature=0 => greedy).
+            do_sample=req.temperature > 0,
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=req.top_k,
