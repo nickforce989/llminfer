@@ -42,6 +42,7 @@ class CompiledBackend(EagerBackend):
         super().__init__(cfg)
         self._compiled = False
         self._warmup_done = False
+        self._original_forward = None
 
     def load(self) -> None:
         super().load()
@@ -60,14 +61,20 @@ class CompiledBackend(EagerBackend):
             self.cfg.compile_dynamic,
         )
         t0 = time.monotonic()
+        self._original_forward = self._model.forward
 
         # Compile the forward pass only (not the entire generate loop)
-        self._model.forward = torch.compile(
-            self._model.forward,
-            mode=self.cfg.compile_mode,
-            dynamic=self.cfg.compile_dynamic,
-            fullgraph=False,   # safer for most models
-        )
+        try:
+            self._model.forward = torch.compile(
+                self._model.forward,
+                mode=self.cfg.compile_mode,
+                dynamic=self.cfg.compile_dynamic,
+                fullgraph=False,   # safer for most models
+            )
+        except Exception:
+            logger.exception("torch.compile setup failed; using eager forward path.")
+            self._compiled = False
+            return
         self._compiled = True
 
         logger.info("Compilation setup done in %.2fs  (first call will trigger JIT)", time.monotonic() - t0)
@@ -102,9 +109,38 @@ class CompiledBackend(EagerBackend):
         self._warmup_done = True
         logger.info("Warmup complete in %.2fs", time.monotonic() - t0)
 
+    @staticmethod
+    def _looks_like_compile_runtime_error(exc: Exception) -> bool:
+        msg = str(exc).lower()
+        hints = (
+            "cudagraph",
+            "torch._dynamo",
+            "aot_autograd",
+            "torch._inductor",
+            "inductor",
+            "overwritten by a subsequent run",
+        )
+        return any(h in msg for h in hints)
+
+    def _fallback_to_eager(self, exc: Exception) -> None:
+        if not self.cfg.compile_fallback_to_eager:
+            raise exc
+        logger.warning("Compiled backend failed at runtime; falling back to eager: %s", exc)
+        if self._original_forward is not None and self._model is not None:
+            self._model.forward = self._original_forward
+        self._compiled = False
+        self._warmup_done = False
+
     def generate(self, requests: List[GenerationRequest]) -> List[GenerationResult]:
         self._mark_cudagraph_step()
-        results = super().generate(requests)
+        try:
+            results = super().generate(requests)
+        except RuntimeError as exc:
+            if self._compiled and self._looks_like_compile_runtime_error(exc):
+                self._fallback_to_eager(exc)
+                results = super().generate(requests)
+            else:
+                raise
         if self._compiled and not self._warmup_done:
             logger.debug("First compiled inference — JIT tracing occurred.")
         return results
@@ -113,4 +149,18 @@ class CompiledBackend(EagerBackend):
         # Streaming with torch.compile works the same way; the compiled
         # forward will be called inside the generate loop.
         self._mark_cudagraph_step()
-        return super().stream(request)
+        parent_stream = super(CompiledBackend, self).stream
+
+        def _iterator() -> Iterator[StreamChunk]:
+            try:
+                for chunk in parent_stream(request):
+                    yield chunk
+            except RuntimeError as exc:
+                if self._compiled and self._looks_like_compile_runtime_error(exc):
+                    self._fallback_to_eager(exc)
+                    for chunk in parent_stream(request):
+                        yield chunk
+                else:
+                    raise
+
+        return _iterator()

@@ -23,6 +23,12 @@ setup(
     ],
     extras_require={
         "vllm": ["vllm>=0.2.0"],
+        "serve": [
+            "fastapi>=0.110.0",
+            "uvicorn>=0.27.0",
+            "prometheus-client>=0.20.0",
+        ],
+        "peft": ["peft>=0.12.0"],
         "dev": ["pytest>=7.0.0", "pytest-asyncio", "black", "isort", "mypy"],
     },
     entry_points={

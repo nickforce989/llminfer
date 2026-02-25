@@ -16,9 +16,12 @@ pip install vllm   (separate install, not in base requirements)
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import queue
+import threading
 import time
-from typing import Iterator, List
+from typing import Iterator, List, Optional
 
 from llminfer.backends.base import BaseBackend
 from llminfer.config import EngineConfig, QuantMode
@@ -39,11 +42,12 @@ class VLLMBackend(BaseBackend):
 
     def __init__(self, cfg: EngineConfig) -> None:
         super().__init__(cfg)
-        self._llm = None
+        self._async_engine = None
+        self._engine_args = None
 
     def load(self) -> None:
         try:
-            from vllm import LLM, SamplingParams
+            from vllm import AsyncEngineArgs, AsyncLLMEngine
         except ImportError:
             raise ImportError(
                 "vLLM is not installed. Install it with:\n"
@@ -64,36 +68,79 @@ class VLLMBackend(BaseBackend):
         if quant:
             kwargs["quantization"] = quant
 
-        self._llm = LLM(**kwargs)
+        self._engine_args = AsyncEngineArgs(**kwargs)
+        self._async_engine = AsyncLLMEngine.from_engine_args(self._engine_args)
         logger.info("vLLM engine ready")
 
     def _make_sampling_params(self, req: GenerationRequest):
         from vllm import SamplingParams
-        return SamplingParams(
+        kwargs = dict(
             max_tokens=req.max_new_tokens,
             temperature=req.temperature,
             top_p=req.top_p,
             top_k=req.top_k,
             repetition_penalty=req.repetition_penalty,
+            stop=req.stop_sequences,
         )
+        if req.bad_words:
+            kwargs["bad_words"] = req.bad_words
+        if req.seed is not None:
+            kwargs["seed"] = req.seed
+        return SamplingParams(**kwargs)
+
+    @staticmethod
+    def _run_async(coro):
+        holder = {"result": None, "error": None}
+
+        def _runner():
+            try:
+                holder["result"] = asyncio.run(coro)
+            except Exception as exc:  # pragma: no cover - passthrough
+                holder["error"] = exc
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        t.join()
+        if holder["error"] is not None:
+            raise holder["error"]
+        return holder["result"]
+
+    @staticmethod
+    def _apply_stop_sequences(text: str, stop_sequences: Optional[List[str]]) -> str:
+        if not stop_sequences:
+            return text
+        cut = len(text)
+        for stop in stop_sequences:
+            idx = text.find(stop)
+            if idx != -1 and idx < cut:
+                cut = idx
+        return text[:cut]
 
     def generate(self, requests: List[GenerationRequest]) -> List[GenerationResult]:
         if not self.is_loaded:
             self.load()
 
-        prompts = [r.prompt for r in requests]
-        sampling_params = [self._make_sampling_params(r) for r in requests]
+        async def _generate_one(req: GenerationRequest):
+            sampling_params = self._make_sampling_params(req)
+            t_start = time.monotonic()
+            final_output = None
+            async for out in self._async_engine.generate(req.prompt, sampling_params, req.request_id):
+                final_output = out
+            total_ms = (time.monotonic() - t_start) * 1000
+            return req, final_output, total_ms
 
-        t_start = time.monotonic()
-        outputs = self._llm.generate(prompts, sampling_params)
-        t_end = time.monotonic()
-        total_ms = (t_end - t_start) * 1000
+        async def _run_all():
+            tasks = [asyncio.create_task(_generate_one(r)) for r in requests]
+            return await asyncio.gather(*tasks)
+
+        outputs = self._run_async(_run_all())
 
         results = []
-        for req, out in zip(requests, outputs):
-            gen_text = out.outputs[0].text
-            gen_tokens = len(out.outputs[0].token_ids)
-            prompt_tokens = len(out.prompt_token_ids)
+        for req, out, total_ms in outputs:
+            gen_text = out.outputs[0].text if out else ""
+            gen_text = self._apply_stop_sequences(gen_text, req.stop_sequences)
+            gen_tokens = len(out.outputs[0].token_ids) if out else 0
+            prompt_tokens = len(out.prompt_token_ids) if out else 0
 
             stats = TokenStats(
                 prompt_tokens=prompt_tokens,
@@ -113,41 +160,96 @@ class VLLMBackend(BaseBackend):
         return results
 
     def stream(self, request: GenerationRequest) -> Iterator[StreamChunk]:
-        """
-        vLLM streaming via async generator.
-        We run the async engine synchronously here for interface compatibility.
-        """
         if not self.is_loaded:
             self.load()
 
-        import asyncio
+        out_q: queue.Queue = queue.Queue()
+        sampling_params = self._make_sampling_params(request)
 
-        from vllm import AsyncEngineArgs, AsyncLLMEngine, SamplingParams
+        def _run_stream() -> None:
+            async def _produce() -> None:
+                t_start = time.monotonic()
+                first_token_time = None
+                emitted_text = ""
+                final_output = None
 
-        # Note: for production streaming, use vllm.AsyncLLMEngine directly.
-        # Here we fake streaming by chunking the completed output.
-        results = self.generate([request])
-        result = results[0]
-        words = result.generated_text.split(" ")
+                async for out in self._async_engine.generate(request.prompt, sampling_params, request.request_id):
+                    final_output = out
+                    latest_text = out.outputs[0].text
+                    clipped = self._apply_stop_sequences(latest_text, request.stop_sequences)
+                    new_text = clipped[len(emitted_text) :]
+                    if new_text:
+                        emitted_text = clipped
+                        if first_token_time is None:
+                            first_token_time = time.monotonic()
+                        out_q.put(("token", new_text))
 
-        t_start = time.monotonic()
-        for i, word in enumerate(words):
-            token = word + (" " if i < len(words) - 1 else "")
-            yield StreamChunk(
-                request_id=request.request_id,
-                token=token,
-                token_id=-1,
-                is_final=False,
-            )
+                    if len(clipped) < len(latest_text):
+                        # Stop sequence matched. Abort remaining generation.
+                        try:
+                            await self._async_engine.abort(request.request_id)
+                        except Exception:
+                            pass
+                        break
 
-        yield StreamChunk(
-            request_id=request.request_id,
-            token="",
-            token_id=-1,
-            is_final=True,
-            stats=result.stats,
-        )
+                t_end = time.monotonic()
+                total_ms = (t_end - t_start) * 1000
+                gen_tokens = len(final_output.outputs[0].token_ids) if final_output else 0
+                prompt_tokens = len(final_output.prompt_token_ids) if final_output else 0
+                ttft_ms = ((first_token_time or t_end) - t_start) * 1000
+
+                stats = TokenStats(
+                    prompt_tokens=prompt_tokens,
+                    generated_tokens=gen_tokens,
+                    time_to_first_token_ms=ttft_ms,
+                    total_latency_ms=total_ms,
+                    throughput_tokens_per_sec=gen_tokens / max(total_ms / 1000, 1e-9),
+                )
+                out_q.put(("final", stats))
+
+            try:
+                asyncio.run(_produce())
+            except Exception as exc:  # pragma: no cover - passthrough
+                out_q.put(("error", exc))
+
+        thread = threading.Thread(target=_run_stream, daemon=True)
+        thread.start()
+
+        while True:
+            kind, payload = out_q.get()
+            if kind == "token":
+                token = payload
+                yield StreamChunk(
+                    request_id=request.request_id,
+                    token=token,
+                    token_id=-1,
+                    is_final=False,
+                )
+                continue
+            if kind == "final":
+                stats = payload
+                yield StreamChunk(
+                    request_id=request.request_id,
+                    token="",
+                    token_id=-1,
+                    is_final=True,
+                    stats=stats,
+                )
+                break
+            if kind == "error":
+                raise payload
+
+        thread.join(timeout=0.1)
 
     @property
     def is_loaded(self) -> bool:
-        return self._llm is not None
+        return self._async_engine is not None
+
+    def unload(self) -> None:
+        if self._async_engine is not None:
+            shutdown = getattr(self._async_engine, "shutdown_background_loop", None)
+            if callable(shutdown):
+                shutdown()
+        self._async_engine = None
+        self._engine_args = None
+        super().unload()

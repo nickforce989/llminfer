@@ -7,7 +7,7 @@ from __future__ import annotations
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import AsyncIterator, List, Optional
+from typing import Any, Callable, List, Optional
 
 
 @dataclass
@@ -19,7 +19,16 @@ class GenerationRequest:
     top_p: float = 0.9
     top_k: int = 50
     repetition_penalty: float = 1.0
+    no_repeat_ngram_size: int = 0
     stream: bool = False
+    # Optional stop strings applied after decoding.
+    stop_sequences: Optional[List[str]] = None
+    # Token-level constraints (best-effort; backend support varies).
+    bad_words: Optional[List[str]] = None
+    force_words: Optional[List[str]] = None
+    prefix_allowed_tokens_fn: Optional[Callable[[int, Any], List[int]]] = None
+    # Optional RNG seed for reproducible sampling.
+    seed: Optional[int] = None
     # Attach a prefix cache key to reuse KV blocks (e.g. system prompt hash)
     prefix_key: Optional[str] = None
 

@@ -32,7 +32,6 @@ from typing import Dict, Iterator, List, Optional
 from llminfer.backends.base import BaseBackend
 from llminfer.backends.compiled import CompiledBackend
 from llminfer.backends.eager import EagerBackend
-from llminfer.batching import SyncBatchQueue
 from llminfer.config import Backend, EngineConfig
 from llminfer.kv_cache import KVCacheManager
 from llminfer.request import GenerationRequest, GenerationResult, StreamChunk
@@ -127,6 +126,13 @@ class InferenceEngine:
 
         return results
 
+    def run_requests(self, requests: List[GenerationRequest]) -> List[GenerationResult]:
+        """
+        Run a heterogeneous request batch (each request can have distinct params).
+        """
+        self._ensure_loaded()
+        return self._backend.generate(requests)
+
     def stream(self, prompt: str, **kwargs) -> Iterator[StreamChunk]:
         """
         Stream token-by-token for a single prompt.
@@ -153,10 +159,27 @@ class InferenceEngine:
             "model": self.cfg.model_name,
             "backend": self.cfg.backend.value,
             "quantization": self.cfg.quant.mode.value,
+            "assistant_model": self.cfg.assistant_model_name,
             "device": self.cfg.device,
             "max_batch_size": self.cfg.max_batch_size,
             "loaded": self._backend is not None and self._backend.is_loaded,
         }
+
+    def load_adapter(self, adapter_path: str, adapter_name: str = "default") -> None:
+        self._ensure_loaded()
+        self._backend.load_adapter(adapter_path=adapter_path, adapter_name=adapter_name)
+
+    def set_adapter(self, adapter_name: str) -> None:
+        self._ensure_loaded()
+        self._backend.set_adapter(adapter_name)
+
+    def unload_adapter(self, adapter_name: Optional[str] = None) -> None:
+        self._ensure_loaded()
+        self._backend.unload_adapter(adapter_name=adapter_name)
+
+    def list_adapters(self) -> List[str]:
+        self._ensure_loaded()
+        return self._backend.list_adapters()
 
     # ------------------------------------------------------------------
     # Context manager

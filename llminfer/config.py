@@ -90,7 +90,11 @@ class EngineConfig:
     # Device
     device: str = "cuda"   # "cuda", "cuda:0", "cpu"
     dtype: str = "auto"    # "auto", "float16", "bfloat16", "float32"
+    # Optional speculative-decoding assistant model (HF generate assistant_model)
+    assistant_model_name: Optional[str] = None
 
     # torch.compile settings (only used if backend == COMPILED)
     compile_mode: str = "reduce-overhead"   # "default", "reduce-overhead", "max-autotune"
     compile_dynamic: bool = True
+    # If compiled execution fails at runtime, automatically fall back to eager.
+    compile_fallback_to_eager: bool = True

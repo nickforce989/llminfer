@@ -144,6 +144,7 @@ bench_result = bm.run(
 )
 bench_result.print_summary()
 bench_result.plot("benchmark_eager.png")
+bench_result.plot_suite("benchmark_eager_plots", prefix="benchmark_eager")
 engine.unload()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -160,5 +161,6 @@ cmp = BackendComparison(
 results = cmp.run(batch_sizes=[1, 2, 4, 8], num_runs=5)
 cmp.print_table(results)
 cmp.plot(results, "comparison_eager_vs_compiled.png")
+cmp.plot_suite(results, "comparison_plots", prefix="comparison_eager_vs_compiled")
 
-print("\n✅ Done. Check benchmark_eager.png and comparison_eager_vs_compiled.png")
+print("\n✅ Done. Check benchmark_eager.png, benchmark_eager_plots/, comparison_eager_vs_compiled.png, and comparison_plots/")

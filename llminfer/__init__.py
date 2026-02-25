@@ -13,6 +13,7 @@ from llminfer.engine import InferenceEngine
 from llminfer.config import EngineConfig, QuantConfig, CacheConfig
 from llminfer.benchmark import Benchmarker, BenchmarkResult
 from llminfer.request import GenerationRequest, GenerationResult
+from llminfer.serving import ContinuousBatchScheduler
 
 __version__ = "0.1.0"
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "BenchmarkResult",
     "GenerationRequest",
     "GenerationResult",
+    "ContinuousBatchScheduler",
 ]

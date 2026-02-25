@@ -13,14 +13,13 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Iterator, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 import torch
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
     BitsAndBytesConfig,
-    GenerationConfig,
     TextIteratorStreamer,
 )
 
@@ -38,6 +37,7 @@ class EagerBackend(BaseBackend):
     def __init__(self, cfg: EngineConfig) -> None:
         super().__init__(cfg)
         self._kv_cache = KVCacheManager(cfg.cache)
+        self._assistant_model = None
 
     # ------------------------------------------------------------------
     # Load
@@ -76,17 +76,31 @@ class EagerBackend(BaseBackend):
             self.cfg.model_name, **load_kwargs
         )
         self._model.eval()
+
+        if self.cfg.assistant_model_name:
+            logger.info("Loading assistant model for speculative decoding: %s", self.cfg.assistant_model_name)
+            self._assistant_model = AutoModelForCausalLM.from_pretrained(
+                self.cfg.assistant_model_name,
+                device_map=self.cfg.device,
+                torch_dtype=torch_dtype,
+            )
+            self._assistant_model.eval()
+
         logger.info("Model loaded  params=%.1fM", self._count_params() / 1e6)
 
     def _count_params(self) -> int:
         return sum(p.numel() for p in self._model.parameters())
+
+    def unload(self) -> None:
+        self._assistant_model = None
+        super().unload()
 
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
 
     def _build_gen_config(self, req: GenerationRequest) -> dict:
-        return dict(
+        cfg = dict(
             max_new_tokens=req.max_new_tokens,
             # Temperature/top-p/top-k only have an effect when sampling is enabled.
             # Treat any positive temperature as sampling mode (temperature=0 => greedy).
@@ -95,10 +109,55 @@ class EagerBackend(BaseBackend):
             top_p=req.top_p,
             top_k=req.top_k,
             repetition_penalty=req.repetition_penalty,
+            no_repeat_ngram_size=req.no_repeat_ngram_size,
             pad_token_id=self._tokenizer.pad_token_id,
             eos_token_id=self._tokenizer.eos_token_id,
             use_cache=True,
         )
+        if req.prefix_allowed_tokens_fn is not None:
+            cfg["prefix_allowed_tokens_fn"] = req.prefix_allowed_tokens_fn
+        return cfg
+
+    def _build_extra_gen_kwargs(self, req: GenerationRequest) -> dict:
+        extra: Dict[str, object] = {}
+
+        if self._assistant_model is not None:
+            extra["assistant_model"] = self._assistant_model
+
+        if req.bad_words:
+            bad_words_ids = [
+                self._tokenizer.encode(phrase, add_special_tokens=False)
+                for phrase in req.bad_words
+            ]
+            bad_words_ids = [ids for ids in bad_words_ids if ids]
+            if bad_words_ids:
+                extra["bad_words_ids"] = bad_words_ids
+
+        if req.force_words:
+            force_words_ids = [
+                self._tokenizer.encode(phrase, add_special_tokens=False)
+                for phrase in req.force_words
+            ]
+            force_words_ids = [ids for ids in force_words_ids if ids]
+            if force_words_ids:
+                extra["force_words_ids"] = force_words_ids
+
+        if req.seed is not None:
+            gen_device = self.cfg.device if "cuda" in self.cfg.device else "cpu"
+            extra["generator"] = torch.Generator(device=gen_device).manual_seed(req.seed)
+
+        return extra
+
+    @staticmethod
+    def _apply_stop_sequences(text: str, stop_sequences: Optional[List[str]]) -> str:
+        if not stop_sequences:
+            return text
+        cut = len(text)
+        for stop in stop_sequences:
+            idx = text.find(stop)
+            if idx != -1 and idx < cut:
+                cut = idx
+        return text[:cut]
 
     def _tokenize_batch(self, prompts: List[str]) -> dict:
         return self._tokenizer(
@@ -119,7 +178,12 @@ class EagerBackend(BaseBackend):
 
         prompts = [r.prompt for r in requests]
         inputs = self._tokenize_batch(prompts)
-        prompt_len = inputs["input_ids"].shape[1]
+        attention_mask = inputs.get("attention_mask")
+        prompt_lens = (
+            attention_mask.sum(dim=1).tolist()
+            if attention_mask is not None
+            else [inputs["input_ids"].shape[1]] * len(requests)
+        )
 
         # Check prefix cache for single-request case
         cache_hit = False
@@ -130,6 +194,7 @@ class EagerBackend(BaseBackend):
 
         t_start = time.monotonic()
         gen_kwargs = self._build_gen_config(requests[0])  # use first req params for batch
+        gen_kwargs.update(self._build_extra_gen_kwargs(requests[0]))
         if past_kv is not None:
             gen_kwargs["past_key_values"] = past_kv
 
@@ -142,8 +207,10 @@ class EagerBackend(BaseBackend):
         results = []
         for i, req in enumerate(requests):
             # Decode only newly generated tokens
+            prompt_len = int(prompt_lens[i])
             gen_ids = outputs[i][prompt_len:]
             gen_text = self._tokenizer.decode(gen_ids, skip_special_tokens=True)
+            gen_text = self._apply_stop_sequences(gen_text, req.stop_sequences)
             gen_tokens = len(gen_ids)
 
             stats = TokenStats(
@@ -180,6 +247,7 @@ class EagerBackend(BaseBackend):
 
         gen_kwargs = {
             **self._build_gen_config(request),
+            **self._build_extra_gen_kwargs(request),
             "streamer": streamer,
         }
 
@@ -225,3 +293,46 @@ class EagerBackend(BaseBackend):
             is_final=True,
             stats=stats,
         )
+
+    # ------------------------------------------------------------------
+    # Adapter hot-swap (PEFT)
+    # ------------------------------------------------------------------
+
+    def load_adapter(self, adapter_path: str, adapter_name: str = "default") -> None:
+        if not self.is_loaded:
+            self.load()
+        try:
+            from peft import PeftModel
+        except ImportError as exc:
+            raise ImportError("PEFT is required for adapter support. Install with `pip install peft`.") from exc
+
+        if isinstance(self._model, PeftModel):
+            self._model.load_adapter(adapter_path, adapter_name=adapter_name)
+        else:
+            self._model = PeftModel.from_pretrained(
+                self._model,
+                adapter_path,
+                adapter_name=adapter_name,
+            )
+        self._model.set_adapter(adapter_name)
+
+    def set_adapter(self, adapter_name: str) -> None:
+        if not self.is_loaded:
+            self.load()
+        if not hasattr(self._model, "set_adapter"):
+            raise RuntimeError("No adapters are loaded on this backend.")
+        self._model.set_adapter(adapter_name)
+
+    def unload_adapter(self, adapter_name: Optional[str] = None) -> None:
+        if not self.is_loaded:
+            return
+        if not hasattr(self._model, "disable_adapter"):
+            raise RuntimeError("No adapters are loaded on this backend.")
+        # PEFT does not always support unloading a single adapter cleanly
+        # across versions, so we disable adapters when requested.
+        self._model.disable_adapter()
+
+    def list_adapters(self) -> List[str]:
+        if not self.is_loaded or not hasattr(self._model, "peft_config"):
+            return []
+        return sorted(list(getattr(self._model, "peft_config").keys()))

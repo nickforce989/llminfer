@@ -24,13 +24,18 @@ result.plot("bench_results.png")
 
 from __future__ import annotations
 
+import csv
 import gc
+import json
 import logging
+import platform
 import statistics
+import sys
 import time
+from datetime import datetime, timezone
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +101,7 @@ class BenchmarkResult:
     model_name: str
     quant_mode: str
     metrics_by_batch: Dict[int, RunMetrics] = field(default_factory=dict)
+    environment: Dict[str, Any] = field(default_factory=dict)
 
     def print_summary(self) -> None:
         try:
@@ -107,6 +113,84 @@ class BenchmarkResult:
 
     def plot(self, output_path: str = "benchmark.png") -> None:
         _plot_results([self], output_path)
+
+    def plot_suite(self, output_dir: str, prefix: str = "benchmark") -> Dict[str, str]:
+        """
+        Save multiple plot files (dashboard + per-metric views).
+        Returns a map of plot type -> output path.
+        """
+        return save_plot_suite([self], output_dir=output_dir, prefix=prefix)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "backend": self.backend_name,
+            "model": self.model_name,
+            "quant_mode": self.quant_mode,
+            "environment": self.environment,
+            "metrics": {
+                str(bs): {
+                    "batch_size": m.batch_size,
+                    "prompt_type": m.prompt_type,
+                    "latencies_ms": m.latencies_ms,
+                    "throughputs_tps": m.throughputs_tps,
+                    "ttfts_ms": m.ttfts_ms,
+                    "gpu_memory_mb": m.gpu_memory_mb,
+                    "mean_latency_ms": m.mean_latency_ms,
+                    "p50_latency_ms": m.p50_latency_ms,
+                    "p95_latency_ms": m.p95_latency_ms,
+                    "p99_latency_ms": m.p99_latency_ms,
+                    "mean_throughput_tps": m.mean_throughput_tps,
+                    "mean_ttft_ms": m.mean_ttft_ms,
+                }
+                for bs, m in sorted(self.metrics_by_batch.items())
+            },
+        }
+
+    def to_rows(self) -> List[Dict[str, Any]]:
+        rows: List[Dict[str, Any]] = []
+        for bs in self.batch_sizes:
+            m = self.metrics_by_batch[bs]
+            rows.append(
+                {
+                    "backend": self.backend_name,
+                    "model": self.model_name,
+                    "quant_mode": self.quant_mode,
+                    "batch_size": bs,
+                    "prompt_type": m.prompt_type,
+                    "mean_latency_ms": m.mean_latency_ms,
+                    "p50_latency_ms": m.p50_latency_ms,
+                    "p95_latency_ms": m.p95_latency_ms,
+                    "p99_latency_ms": m.p99_latency_ms,
+                    "mean_throughput_tps": m.mean_throughput_tps,
+                    "mean_ttft_ms": m.mean_ttft_ms,
+                    "gpu_memory_mb": m.gpu_memory_mb,
+                }
+            )
+        return rows
+
+    def save_json(self, output_path: str) -> None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "schema_version": "1.0",
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "result": self.to_dict(),
+        }
+        path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        logger.info("Saved benchmark JSON to %s", path)
+
+    def save_csv(self, output_path: str) -> None:
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rows = self.to_rows()
+        if not rows:
+            path.write_text("", encoding="utf-8")
+            return
+        with path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(rows)
+        logger.info("Saved benchmark CSV to %s", path)
 
     @property
     def batch_sizes(self) -> List[int]:
@@ -162,6 +246,7 @@ class Benchmarker:
             backend_name=cfg.backend.value,
             model_name=cfg.model_name,
             quant_mode=cfg.quant.mode.value,
+            environment=_collect_environment_metadata(),
         )
 
         prompt = _PROMPTS.get(prompt_type, _PROMPTS["medium"])
@@ -287,6 +372,18 @@ class BackendComparison:
     def plot(self, results: List[BenchmarkResult], output_path: str = "comparison.png") -> None:
         _plot_results(results, output_path)
 
+    def plot_suite(
+        self,
+        results: List[BenchmarkResult],
+        output_dir: str,
+        prefix: str = "comparison",
+    ) -> Dict[str, str]:
+        """
+        Save multiple comparison plots (dashboard + per-metric views).
+        Returns a map of plot type -> output path.
+        """
+        return save_plot_suite(results, output_dir=output_dir, prefix=prefix)
+
 
 # ---------------------------------------------------------------------------
 # Plotting
@@ -347,13 +444,199 @@ def _plot_results(results: List[BenchmarkResult], output_path: str) -> None:
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
-        ax.legend(fontsize=8)
+        handles, labels = ax.get_legend_handles_labels()
+        if handles:
+            ax.legend(fontsize=8)
         ax.spines["top"].set_visible(False)
         ax.spines["right"].set_visible(False)
 
     plt.savefig(output_path, dpi=150, bbox_inches="tight")
     logger.info("Saved benchmark plot to %s", output_path)
     plt.close()
+
+
+def save_plot_suite(
+    results: List[BenchmarkResult],
+    output_dir: str,
+    prefix: str = "benchmark",
+) -> Dict[str, str]:
+    """
+    Save a suite of plots for a benchmark or backend comparison.
+
+    Produces:
+      - dashboard: combined 2x2 figure
+      - throughput: line plot
+      - latency: line plot
+      - ttft: line plot (if available)
+      - memory: bar chart
+    """
+    outdir = Path(output_dir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    plot_paths: Dict[str, str] = {}
+
+    dashboard = outdir / f"{prefix}_dashboard.png"
+    _plot_results(results, str(dashboard))
+    if dashboard.exists():
+        plot_paths["dashboard"] = str(dashboard)
+
+    throughput = outdir / f"{prefix}_throughput.png"
+    if _plot_line_metric(
+        results=results,
+        output_path=str(throughput),
+        title="Throughput vs Batch Size",
+        ylabel="Tokens / sec",
+        value_fn=lambda m: m.mean_throughput_tps,
+        marker="o",
+    ):
+        plot_paths["throughput"] = str(throughput)
+
+    latency = outdir / f"{prefix}_latency.png"
+    if _plot_line_metric(
+        results=results,
+        output_path=str(latency),
+        title="Latency vs Batch Size",
+        ylabel="Latency (ms)",
+        value_fn=lambda m: m.mean_latency_ms,
+        marker="s",
+    ):
+        plot_paths["latency"] = str(latency)
+
+    ttft = outdir / f"{prefix}_ttft.png"
+    if _plot_line_metric(
+        results=results,
+        output_path=str(ttft),
+        title="TTFT vs Batch Size",
+        ylabel="TTFT (ms)",
+        value_fn=lambda m: m.mean_ttft_ms if m.ttfts_ms else None,
+        marker="^",
+    ):
+        plot_paths["ttft"] = str(ttft)
+
+    memory = outdir / f"{prefix}_memory.png"
+    if _plot_memory_metric(results=results, output_path=str(memory)):
+        plot_paths["memory"] = str(memory)
+
+    return plot_paths
+
+
+def save_comparison_plot_suite(
+    results: List[BenchmarkResult],
+    output_dir: str,
+    prefix: str = "comparison",
+) -> Dict[str, str]:
+    return save_plot_suite(results=results, output_dir=output_dir, prefix=prefix)
+
+
+def _plot_line_metric(
+    results: List[BenchmarkResult],
+    output_path: str,
+    title: str,
+    ylabel: str,
+    value_fn,
+    marker: str = "o",
+) -> bool:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed; skipping plot.")
+        return False
+
+    colors = ["#2196F3", "#4CAF50", "#FF5722", "#9C27B0"]
+    fig, ax = plt.subplots(figsize=(8, 5))
+    any_series = False
+
+    for i, res in enumerate(results):
+        color = colors[i % len(colors)]
+        label = f"{res.backend_name} ({res.quant_mode})"
+
+        xs: List[int] = []
+        ys: List[float] = []
+        for bs in res.batch_sizes:
+            value = value_fn(res.metrics_by_batch[bs])
+            if value is None:
+                continue
+            xs.append(bs)
+            ys.append(float(value))
+        if not xs:
+            continue
+        any_series = True
+        ax.plot(xs, ys, f"{marker}-", color=color, label=label, linewidth=2, markersize=6)
+
+    if not any_series:
+        plt.close(fig)
+        return False
+
+    ax.set_title(title, fontsize=12, fontweight="bold")
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend(fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    logger.info("Saved plot to %s", output_path)
+    plt.close(fig)
+    return True
+
+
+def _plot_memory_metric(results: List[BenchmarkResult], output_path: str) -> bool:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        logger.warning("matplotlib not installed; skipping plot.")
+        return False
+
+    colors = ["#2196F3", "#4CAF50", "#FF5722", "#9C27B0"]
+    fig, ax = plt.subplots(figsize=(8, 5))
+
+    all_bs = sorted(set(bs for r in results for bs in r.batch_sizes))
+    if not all_bs:
+        plt.close(fig)
+        return False
+
+    width = 0.8 / max(len(results), 1)
+    base_positions = list(range(len(all_bs)))
+
+    any_bar = False
+    for i, res in enumerate(results):
+        ys: List[float] = []
+        for bs in all_bs:
+            if bs in res.metrics_by_batch:
+                ys.append(res.metrics_by_batch[bs].gpu_memory_mb)
+            else:
+                ys.append(0.0)
+        if any(y > 0 for y in ys):
+            any_bar = True
+        positions = [x - 0.4 + width / 2 + i * width for x in base_positions]
+        ax.bar(
+            positions,
+            ys,
+            width=width,
+            color=colors[i % len(colors)],
+            alpha=0.85,
+            label=f"{res.backend_name} ({res.quant_mode})",
+        )
+
+    if not any_bar:
+        plt.close(fig)
+        return False
+
+    ax.set_title("GPU Memory vs Batch Size", fontsize=12, fontweight="bold")
+    ax.set_xlabel("Batch Size")
+    ax.set_ylabel("Memory (MB)")
+    ax.set_xticks(base_positions)
+    ax.set_xticklabels([str(b) for b in all_bs])
+    ax.grid(True, alpha=0.3, axis="y")
+    ax.legend(fontsize=8)
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+
+    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    logger.info("Saved plot to %s", output_path)
+    plt.close(fig)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -449,9 +732,66 @@ def _plain_comparison_table(results: List[BenchmarkResult]) -> None:
         print(row)
 
 
+def save_comparison_json(results: List[BenchmarkResult], output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema_version": "1.0",
+        "exported_at": datetime.now(timezone.utc).isoformat(),
+        "results": [r.to_dict() for r in results],
+    }
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    logger.info("Saved comparison JSON to %s", path)
+
+
+def save_comparison_csv(results: List[BenchmarkResult], output_path: str) -> None:
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rows: List[Dict[str, Any]] = []
+    for result in results:
+        rows.extend(result.to_rows())
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Saved comparison CSV to %s", path)
+
+
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
+
+def _collect_environment_metadata() -> Dict[str, Any]:
+    metadata: Dict[str, Any] = {
+        "python_version": sys.version.split()[0],
+        "platform": platform.platform(),
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    try:
+        import torch
+
+        metadata["torch_version"] = torch.__version__
+        metadata["cuda_available"] = torch.cuda.is_available()
+        metadata["cuda_version"] = torch.version.cuda
+        if torch.cuda.is_available():
+            metadata["gpu_name"] = torch.cuda.get_device_name(0)
+            props = torch.cuda.get_device_properties(0)
+            metadata["gpu_total_memory_mb"] = int(props.total_memory / 1024 / 1024)
+    except Exception:
+        pass
+
+    try:
+        import transformers
+
+        metadata["transformers_version"] = transformers.__version__
+    except Exception:
+        pass
+
+    return metadata
 
 def _flush_cuda_cache() -> None:
     gc.collect()
