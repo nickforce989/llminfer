@@ -142,11 +142,21 @@ class EagerBackend(BaseBackend):
             if force_words_ids:
                 extra["force_words_ids"] = force_words_ids
 
-        if req.seed is not None:
-            gen_device = self.cfg.device if "cuda" in self.cfg.device else "cpu"
-            extra["generator"] = torch.Generator(device=gen_device).manual_seed(req.seed)
-
         return extra
+
+    @staticmethod
+    def _apply_seed(seed: Optional[int]) -> None:
+        """
+        Apply per-request seed in a transformers-version-safe way.
+
+        Some transformers versions reject `generator` as a generate kwarg for
+        certain models. Seeding global torch RNG avoids that incompatibility.
+        """
+        if seed is None:
+            return
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
 
     @staticmethod
     def _apply_stop_sequences(text: str, stop_sequences: Optional[List[str]]) -> str:
@@ -192,6 +202,7 @@ class EagerBackend(BaseBackend):
             past_kv = self._kv_cache.lookup_prefix(requests[0].prefix_key)
             cache_hit = past_kv is not None
 
+        self._apply_seed(requests[0].seed)
         t_start = time.monotonic()
         gen_kwargs = self._build_gen_config(requests[0])  # use first req params for batch
         gen_kwargs.update(self._build_extra_gen_kwargs(requests[0]))
@@ -250,6 +261,7 @@ class EagerBackend(BaseBackend):
             **self._build_extra_gen_kwargs(request),
             "streamer": streamer,
         }
+        self._apply_seed(request.seed)
 
         # Run generate in background thread so we can yield from main thread
         t_start = time.monotonic()
