@@ -37,6 +37,28 @@ def test_engine_config_defaults():
     assert cfg.backend == Backend.EAGER
     assert cfg.quant.mode == QuantMode.NONE
     assert cfg.max_batch_size == 8
+    assert cfg.hf_trust_remote_code is True
+    assert cfg.tensor_parallel_size == 1
+    assert cfg.pipeline_parallel_size == 1
+    assert cfg.compile_cudagraphs is True
+
+
+def test_engine_config_hf_kwargs():
+    from llminfer.config import EngineConfig
+
+    cfg = EngineConfig(
+        hf_revision="main",
+        hf_token="hf_dummy",
+        hf_local_files_only=True,
+        hf_trust_remote_code=False,
+        hf_cache_dir="/tmp/hf-cache",
+    )
+    kwargs = cfg.hf_model_kwargs()
+    assert kwargs["revision"] == "main"
+    assert kwargs["token"] == "hf_dummy"
+    assert kwargs["local_files_only"] is True
+    assert kwargs["trust_remote_code"] is False
+    assert kwargs["cache_dir"] == "/tmp/hf-cache"
 
 
 # ─── KV Cache ───────────────────────────────────────────────────────────────
@@ -110,6 +132,31 @@ def test_prefix_cache_disabled():
     assert cache.lookup_prefix(key) is None  # disabled
 
 
+def test_kv_cache_paged_materialization():
+    from llminfer.config import CacheConfig
+    from llminfer.kv_cache import KVCacheManager
+    import torch
+
+    cfg = CacheConfig(enable_paged_kv=True, page_size_tokens=2)
+    cache = KVCacheManager(cfg)
+    fake_kv = (
+        (
+            torch.zeros(1, 2, 6, 4),
+            torch.zeros(1, 2, 6, 4),
+        ),
+    )
+
+    cache.update("seq-paged", fake_kv, seq_len=6)
+    restored = cache.get("seq-paged")
+
+    assert restored is not None
+    assert restored[0][0].shape[-2] == 6
+    stats = cache.stats()
+    assert stats["active_paged_entries"] == 1
+    assert stats["active_pages"] == 3
+    assert stats["paged_reads"] >= 1
+
+
 # ─── Batching ───────────────────────────────────────────────────────────────
 
 def test_sync_batch_queue():
@@ -139,6 +186,8 @@ def test_generation_request_defaults():
     req = GenerationRequest(prompt="hello")
     assert req.max_new_tokens == 256
     assert req.temperature == 1.0
+    assert req.speculative_num_assistant_tokens is None
+    assert req.speculative_confidence_threshold is None
     assert req.request_id is not None
     assert req.arrival_time > 0
 
@@ -226,3 +275,49 @@ def test_engine_context_manager_mocked():
 
     engine.load.assert_called_once()
     engine.unload.assert_called_once()
+
+
+def test_engine_applies_generation_defaults():
+    from llminfer.engine import InferenceEngine
+    from llminfer.config import EngineConfig
+    from llminfer.request import GenerationResult, TokenStats
+
+    cfg = EngineConfig(
+        max_new_tokens=77,
+        temperature=0.3,
+        top_p=0.8,
+        top_k=17,
+        repetition_penalty=1.1,
+        speculative_num_assistant_tokens=6,
+        speculative_confidence_threshold=0.4,
+    )
+    engine = InferenceEngine(cfg)
+
+    class _Backend:
+        is_loaded = True
+
+        def __init__(self):
+            self.last_requests = None
+
+        def generate(self, requests):
+            self.last_requests = requests
+            return [
+                GenerationResult(
+                    request_id=requests[0].request_id,
+                    prompt=requests[0].prompt,
+                    generated_text="ok",
+                    stats=TokenStats(generated_tokens=1, total_latency_ms=1),
+                )
+            ]
+
+    fake = _Backend()
+    engine._backend = fake
+    engine.run("hello")
+    req = fake.last_requests[0]
+    assert req.max_new_tokens == 77
+    assert req.temperature == 0.3
+    assert req.top_p == 0.8
+    assert req.top_k == 17
+    assert req.repetition_penalty == 1.1
+    assert req.speculative_num_assistant_tokens == 6
+    assert req.speculative_confidence_threshold == 0.4

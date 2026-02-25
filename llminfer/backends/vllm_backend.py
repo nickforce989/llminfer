@@ -17,6 +17,7 @@ pip install vllm   (separate install, not in base requirements)
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import queue
 import threading
@@ -58,15 +59,36 @@ class VLLMBackend(BaseBackend):
         logger.info("Loading vLLM engine  model=%s", self.cfg.model_name)
 
         quant = self.QUANT_MAP.get(self.cfg.quant.mode)
+        gpu_util = min(0.98, max(self.cfg.cache.gpu_memory_fraction + 0.75, 0.1))
         kwargs: dict = {
             "model": self.cfg.model_name,
             "dtype": self.cfg.dtype if self.cfg.dtype != "auto" else "auto",
-            "gpu_memory_utilization": self.cfg.cache.gpu_memory_fraction + 0.75,  # vLLM uses most of VRAM
+            "gpu_memory_utilization": gpu_util,  # vLLM typically uses most of VRAM
             "max_model_len": self.cfg.cache.max_seq_len,
-            "trust_remote_code": True,
+            "trust_remote_code": self.cfg.hf_trust_remote_code,
+            "tensor_parallel_size": max(1, int(self.cfg.tensor_parallel_size)),
+            "pipeline_parallel_size": max(1, int(self.cfg.pipeline_parallel_size)),
         }
         if quant:
             kwargs["quantization"] = quant
+        if self.cfg.assistant_model_name:
+            kwargs["speculative_model"] = self.cfg.assistant_model_name
+        if self.cfg.speculative_num_assistant_tokens is not None:
+            kwargs["num_speculative_tokens"] = int(self.cfg.speculative_num_assistant_tokens)
+        if self.cfg.hf_revision:
+            kwargs["revision"] = self.cfg.hf_revision
+            kwargs["tokenizer_revision"] = self.cfg.hf_revision
+        if self.cfg.hf_token:
+            # Different vLLM versions expose either `token` or `hf_token`.
+            kwargs["token"] = self.cfg.hf_token
+            kwargs["hf_token"] = self.cfg.hf_token
+        if self.cfg.hf_cache_dir:
+            kwargs["download_dir"] = self.cfg.hf_cache_dir
+
+        # Keep compatibility across vLLM versions by filtering unsupported args.
+        sig = inspect.signature(AsyncEngineArgs.__init__)
+        allowed = set(sig.parameters.keys())
+        kwargs = {k: v for k, v in kwargs.items() if k in allowed}
 
         self._engine_args = AsyncEngineArgs(**kwargs)
         self._async_engine = AsyncLLMEngine.from_engine_args(self._engine_args)

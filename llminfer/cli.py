@@ -36,6 +36,59 @@ console = Console()
 logging.basicConfig(level=logging.WARNING)
 
 
+def _build_engine_config(
+    *,
+    model: str,
+    backend: str,
+    quant: str,
+    max_new_tokens: Optional[int] = None,
+    assistant_model: Optional[str] = None,
+    max_batch_size: Optional[int] = None,
+    batch_timeout_ms: Optional[float] = None,
+    hf_revision: Optional[str] = None,
+    hf_token: Optional[str] = None,
+    hf_local_files_only: bool = False,
+    hf_trust_remote_code: bool = True,
+    hf_cache_dir: Optional[str] = None,
+    paged_kv: bool = False,
+    page_size_tokens: int = 16,
+    tensor_parallel_size: int = 1,
+    pipeline_parallel_size: int = 1,
+    compile_fullgraph: bool = False,
+    compile_cudagraphs: bool = True,
+    speculative_num_assistant_tokens: Optional[int] = None,
+    speculative_confidence_threshold: Optional[float] = None,
+):
+    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
+
+    cfg = EngineConfig(
+        model_name=model,
+        backend=Backend(backend),
+        quant=QuantConfig(mode=QuantMode(quant)),
+        assistant_model_name=assistant_model,
+        hf_revision=hf_revision,
+        hf_token=hf_token,
+        hf_local_files_only=hf_local_files_only,
+        hf_trust_remote_code=hf_trust_remote_code,
+        hf_cache_dir=hf_cache_dir,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
+    )
+    if max_new_tokens is not None:
+        cfg.max_new_tokens = max_new_tokens
+    if max_batch_size is not None:
+        cfg.max_batch_size = max_batch_size
+    if batch_timeout_ms is not None:
+        cfg.batch_timeout_ms = batch_timeout_ms
+    cfg.cache.enable_paged_kv = paged_kv
+    cfg.cache.page_size_tokens = page_size_tokens
+    return cfg
+
+
 @app.command()
 def run(
     prompt: str = typer.Argument(..., help="Input prompt"),
@@ -53,19 +106,43 @@ def run(
     bad_words: Optional[str] = typer.Option(None, "--bad-words", help="Comma-separated phrases to avoid"),
     force_words: Optional[str] = typer.Option(None, "--force-words", help="Comma-separated phrases to force"),
     assistant_model: Optional[str] = typer.Option(None, "--assistant-model", help="Speculative decoding assistant model"),
+    revision: Optional[str] = typer.Option(None, "--revision", help="HF model revision (branch/tag/commit)"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token", help="HF token for gated/private models"),
+    local_files_only: bool = typer.Option(False, "--local-files-only", help="Load weights from local HF cache only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir", help="HF cache/download directory"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv", help="Enable paged KV representation"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1, help="Tensor parallel size"),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1, help="Pipeline parallel size"),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
     adapter: Optional[str] = typer.Option(None, "--adapter", help="Path or repo id for LoRA adapter"),
     adapter_name: str = typer.Option("default", "--adapter-name"),
 ) -> None:
     """Run inference on a single prompt."""
     from llminfer import InferenceEngine
-    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
-
-    cfg = EngineConfig(
-        model_name=model,
-        backend=Backend(backend),
-        quant=QuantConfig(mode=QuantMode(quant)),
+    cfg = _build_engine_config(
+        model=model,
+        backend=backend,
+        quant=quant,
         max_new_tokens=max_tokens,
-        assistant_model_name=assistant_model,
+        assistant_model=assistant_model,
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
 
     with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
@@ -91,6 +168,8 @@ def run(
         seed=seed,
         bad_words=bad_words_list,
         force_words=force_words_list,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
 
     console.print(f"\n[bold green]Generated:[/bold green]")
@@ -115,18 +194,42 @@ def stream(
     seed: Optional[int] = typer.Option(None, "--seed"),
     no_repeat_ngram_size: int = typer.Option(0, "--no-repeat-ngram-size"),
     assistant_model: Optional[str] = typer.Option(None, "--assistant-model"),
+    revision: Optional[str] = typer.Option(None, "--revision", help="HF model revision"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token"),
+    local_files_only: bool = typer.Option(False, "--local-files-only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
     adapter: Optional[str] = typer.Option(None, "--adapter", help="Path or repo id for LoRA adapter"),
     adapter_name: str = typer.Option("default", "--adapter-name"),
 ) -> None:
     """Stream token-by-token output."""
     from llminfer import InferenceEngine
-    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
-
-    cfg = EngineConfig(
-        model_name=model,
-        backend=Backend(backend),
-        quant=QuantConfig(mode=QuantMode(quant)),
-        assistant_model_name=assistant_model,
+    cfg = _build_engine_config(
+        model=model,
+        backend=backend,
+        quant=quant,
+        assistant_model=assistant_model,
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
     engine = InferenceEngine(cfg)
     engine.load()
@@ -143,6 +246,8 @@ def stream(
         stop_sequences=stop_sequences,
         seed=seed,
         no_repeat_ngram_size=no_repeat_ngram_size,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     ):
         if not chunk.is_final:
             print(chunk.token, end="", flush=True)
@@ -163,6 +268,20 @@ def bench(
     batch_sizes: str = typer.Option("1,2,4,8", "--batch-sizes"),
     num_runs: int = typer.Option(10, "--runs"),
     max_tokens: int = typer.Option(128, "--max-tokens"),
+    continuous: bool = typer.Option(False, "--continuous/--no-continuous", help="Benchmark with continuous batching"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token"),
+    local_files_only: bool = typer.Option(False, "--local-files-only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
     plot: Optional[str] = typer.Option(None, "--plot", help="Save plot to this path"),
     plot_suite_dir: Optional[str] = typer.Option(
         None,
@@ -175,21 +294,38 @@ def bench(
 ) -> None:
     """Run throughput / latency benchmark."""
     from llminfer import Benchmarker, InferenceEngine
-    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
 
     bs_list = [int(x) for x in batch_sizes.split(",")]
 
-    cfg = EngineConfig(
-        model_name=model,
-        backend=Backend(backend),
-        quant=QuantConfig(mode=QuantMode(quant)),
+    cfg = _build_engine_config(
+        model=model,
+        backend=backend,
+        quant=quant,
         max_batch_size=max(bs_list),
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
     engine = InferenceEngine(cfg)
     engine.load()
 
     bm = Benchmarker(engine)
-    result = bm.run(batch_sizes=bs_list, num_runs=num_runs, max_new_tokens=max_tokens)
+    result = bm.run(
+        batch_sizes=bs_list,
+        num_runs=num_runs,
+        max_new_tokens=max_tokens,
+        use_continuous_batching=continuous,
+    )
     result.print_summary()
 
     if plot:
@@ -222,6 +358,20 @@ def compare(
     quant: str = typer.Option("none", "--quant", "-q"),
     batch_sizes: str = typer.Option("1,2,4,8", "--batch-sizes"),
     num_runs: int = typer.Option(5, "--runs"),
+    continuous: bool = typer.Option(False, "--continuous/--no-continuous", help="Benchmark with continuous batching"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token"),
+    local_files_only: bool = typer.Option(False, "--local-files-only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
     plot: Optional[str] = typer.Option(None, "--plot"),
     plot_suite_dir: Optional[str] = typer.Option(
         None,
@@ -245,8 +395,29 @@ def compare(
     bs_list = [int(x) for x in batch_sizes.split(",")]
     qm = QuantMode(quant)
 
-    cmp = BackendComparison(model_name=model, backends=backend_list, quant_mode=qm)
-    results = cmp.run(batch_sizes=bs_list, num_runs=num_runs)
+    cmp = BackendComparison(
+        model_name=model,
+        backends=backend_list,
+        quant_mode=qm,
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
+    )
+    results = cmp.run(
+        batch_sizes=bs_list,
+        num_runs=num_runs,
+        use_continuous_batching=continuous,
+    )
     cmp.print_table(results)
 
     if plot:
@@ -283,6 +454,19 @@ def serve(
     model_alias: Optional[str] = typer.Option(None, "--model-alias"),
     max_batch_size: int = typer.Option(16, "--max-batch-size"),
     batch_timeout_ms: float = typer.Option(20.0, "--batch-timeout-ms"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token"),
+    local_files_only: bool = typer.Option(False, "--local-files-only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
     max_queue_size: int = typer.Option(1024, "--max-queue-size"),
     log_level: str = typer.Option("info", "--log-level"),
 ) -> None:
@@ -296,16 +480,28 @@ def serve(
 
     from llminfer import InferenceEngine
     from llminfer.api import create_openai_app
-    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
     from llminfer.serving import ContinuousBatchScheduler
 
-    cfg = EngineConfig(
-        model_name=model,
-        backend=Backend(backend),
-        quant=QuantConfig(mode=QuantMode(quant)),
-        assistant_model_name=assistant_model,
+    cfg = _build_engine_config(
+        model=model,
+        backend=backend,
+        quant=quant,
+        assistant_model=assistant_model,
         max_batch_size=max_batch_size,
         batch_timeout_ms=batch_timeout_ms,
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
     engine = InferenceEngine(cfg)
     scheduler = ContinuousBatchScheduler(
@@ -328,17 +524,42 @@ def info(
     model: str = typer.Option("facebook/opt-125m", "--model", "-m"),
     backend: str = typer.Option("eager", "--backend", "-b"),
     quant: str = typer.Option("none", "--quant", "-q"),
+    revision: Optional[str] = typer.Option(None, "--revision"),
+    hf_token: Optional[str] = typer.Option(None, "--hf-token"),
+    local_files_only: bool = typer.Option(False, "--local-files-only"),
+    trust_remote_code: bool = typer.Option(True, "--trust-remote-code/--no-trust-remote-code"),
+    cache_dir: Optional[str] = typer.Option(None, "--cache-dir"),
+    paged_kv: bool = typer.Option(False, "--paged-kv/--no-paged-kv"),
+    page_size_tokens: int = typer.Option(16, "--page-size-tokens", min=1),
+    tensor_parallel_size: int = typer.Option(1, "--tp-size", min=1),
+    pipeline_parallel_size: int = typer.Option(1, "--pp-size", min=1),
+    compile_fullgraph: bool = typer.Option(False, "--compile-fullgraph/--no-compile-fullgraph"),
+    compile_cudagraphs: bool = typer.Option(True, "--compile-cudagraphs/--no-compile-cudagraphs"),
+    speculative_num_assistant_tokens: Optional[int] = typer.Option(None, "--spec-num-assistant-tokens"),
+    speculative_confidence_threshold: Optional[float] = typer.Option(None, "--spec-confidence-threshold"),
 ) -> None:
     """Show engine configuration and model info."""
     from llminfer import InferenceEngine
-    from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
     from rich.panel import Panel
     from rich.pretty import Pretty
 
-    cfg = EngineConfig(
-        model_name=model,
-        backend=Backend(backend),
-        quant=QuantConfig(mode=QuantMode(quant)),
+    cfg = _build_engine_config(
+        model=model,
+        backend=backend,
+        quant=quant,
+        hf_revision=revision,
+        hf_token=hf_token,
+        hf_local_files_only=local_files_only,
+        hf_trust_remote_code=trust_remote_code,
+        hf_cache_dir=cache_dir,
+        paged_kv=paged_kv,
+        page_size_tokens=page_size_tokens,
+        tensor_parallel_size=tensor_parallel_size,
+        pipeline_parallel_size=pipeline_parallel_size,
+        compile_fullgraph=compile_fullgraph,
+        compile_cudagraphs=compile_cudagraphs,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
     engine = InferenceEngine(cfg)
     engine.load()

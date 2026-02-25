@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, Optional
+from typing import Dict, Optional
 
 
 class QuantMode(str, Enum):
@@ -63,6 +63,9 @@ class CacheConfig:
     eviction: CacheEviction = CacheEviction.LRU
     # Prefix caching: reuse KV blocks for common prompt prefixes
     enable_prefix_cache: bool = True
+    # Store cache entries as fixed-size token pages to reduce fragmentation.
+    enable_paged_kv: bool = False
+    page_size_tokens: int = 16
     # GPU memory fraction to allocate for the KV cache
     gpu_memory_fraction: float = 0.15
 
@@ -81,6 +84,9 @@ class EngineConfig:
     top_p: float = 0.9
     top_k: int = 50
     repetition_penalty: float = 1.0
+    # Speculative decoding controls (used when assistant_model_name is set).
+    speculative_num_assistant_tokens: Optional[int] = None
+    speculative_confidence_threshold: Optional[float] = None
 
     # Batching
     max_batch_size: int = 8
@@ -90,11 +96,44 @@ class EngineConfig:
     # Device
     device: str = "cuda"   # "cuda", "cuda:0", "cpu"
     dtype: str = "auto"    # "auto", "float16", "bfloat16", "float32"
+    # Parallelism
+    tensor_parallel_size: int = 1
+    pipeline_parallel_size: int = 1
+    # Hugging Face loading controls
+    hf_revision: Optional[str] = None
+    hf_token: Optional[str] = None
+    hf_local_files_only: bool = False
+    hf_trust_remote_code: bool = True
+    hf_cache_dir: Optional[str] = None
     # Optional speculative-decoding assistant model (HF generate assistant_model)
     assistant_model_name: Optional[str] = None
 
     # torch.compile settings (only used if backend == COMPILED)
     compile_mode: str = "reduce-overhead"   # "default", "reduce-overhead", "max-autotune"
     compile_dynamic: bool = True
+    compile_fullgraph: bool = False
+    compile_cudagraphs: bool = True
     # If compiled execution fails at runtime, automatically fall back to eager.
     compile_fallback_to_eager: bool = True
+
+    def hf_model_kwargs(self) -> Dict[str, object]:
+        """
+        Common kwargs for Hugging Face `from_pretrained` model loading.
+        """
+        kwargs: Dict[str, object] = {
+            "trust_remote_code": self.hf_trust_remote_code,
+            "local_files_only": self.hf_local_files_only,
+        }
+        if self.hf_revision:
+            kwargs["revision"] = self.hf_revision
+        if self.hf_token:
+            kwargs["token"] = self.hf_token
+        if self.hf_cache_dir:
+            kwargs["cache_dir"] = self.hf_cache_dir
+        return kwargs
+
+    def hf_tokenizer_kwargs(self) -> Dict[str, object]:
+        """
+        Common kwargs for Hugging Face tokenizer `from_pretrained` loading.
+        """
+        return self.hf_model_kwargs().copy()

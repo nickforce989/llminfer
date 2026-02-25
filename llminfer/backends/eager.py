@@ -10,6 +10,7 @@ Uses standard HuggingFace transformers with:
 
 from __future__ import annotations
 
+import ast
 import logging
 import threading
 import time
@@ -47,8 +48,13 @@ class EagerBackend(BaseBackend):
         logger.info("Loading model %s  quant=%s", self.cfg.model_name, self.cfg.quant.mode)
 
         # Tokenizer
+        tokenizer_kwargs = {
+            "padding_side": "left",
+            **self.cfg.hf_tokenizer_kwargs(),
+        }
         self._tokenizer = AutoTokenizer.from_pretrained(
-            self.cfg.model_name, padding_side="left"
+            self.cfg.model_name,
+            **tokenizer_kwargs,
         )
         if self._tokenizer.pad_token is None:
             self._tokenizer.pad_token = self._tokenizer.eos_token
@@ -64,10 +70,12 @@ class EagerBackend(BaseBackend):
             "float32": torch.float32,
         }
         torch_dtype = dtype_map.get(self.cfg.dtype, "auto")
+        device_map = self._resolve_device_map(use_quantized=bnb_config is not None)
 
         load_kwargs: dict = {
-            "device_map": self.cfg.device if not bnb_config else "auto",
+            "device_map": device_map,
             "torch_dtype": torch_dtype,
+            **self.cfg.hf_model_kwargs(),
         }
         if bnb_config:
             load_kwargs["quantization_config"] = bnb_config
@@ -81,8 +89,9 @@ class EagerBackend(BaseBackend):
             logger.info("Loading assistant model for speculative decoding: %s", self.cfg.assistant_model_name)
             self._assistant_model = AutoModelForCausalLM.from_pretrained(
                 self.cfg.assistant_model_name,
-                device_map=self.cfg.device,
+                device_map=device_map,
                 torch_dtype=torch_dtype,
+                **self.cfg.hf_model_kwargs(),
             )
             self._assistant_model.eval()
 
@@ -98,6 +107,37 @@ class EagerBackend(BaseBackend):
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    def _resolve_device_map(self, use_quantized: bool) -> object:
+        """
+        Resolve device mapping while supporting multi-GPU tensor parallel config.
+
+        Native tensor parallelism is delegated to vLLM. For HF eager/compiled we
+        use model sharding (`device_map="auto"`) when tensor_parallel_size > 1.
+        """
+        if use_quantized:
+            return "auto"
+        tp_size = max(1, int(self.cfg.tensor_parallel_size))
+        if tp_size <= 1:
+            return self.cfg.device
+        if not torch.cuda.is_available():
+            logger.warning(
+                "tensor_parallel_size=%d requested but CUDA is unavailable; using device=%s",
+                tp_size,
+                self.cfg.device,
+            )
+            return self.cfg.device
+        if torch.cuda.device_count() < tp_size:
+            logger.warning(
+                "tensor_parallel_size=%d requested but only %d CUDA devices found; using auto sharding",
+                tp_size,
+                torch.cuda.device_count(),
+            )
+        logger.info(
+            "Using HF auto-sharding for tensor_parallel_size=%d (native TP is available on vLLM backend)",
+            tp_size,
+        )
+        return "auto"
 
     def _build_gen_config(self, req: GenerationRequest) -> dict:
         cfg = dict(
@@ -123,6 +163,20 @@ class EagerBackend(BaseBackend):
 
         if self._assistant_model is not None:
             extra["assistant_model"] = self._assistant_model
+            speculative_tokens = (
+                req.speculative_num_assistant_tokens
+                if req.speculative_num_assistant_tokens is not None
+                else self.cfg.speculative_num_assistant_tokens
+            )
+            confidence_threshold = (
+                req.speculative_confidence_threshold
+                if req.speculative_confidence_threshold is not None
+                else self.cfg.speculative_confidence_threshold
+            )
+            if speculative_tokens is not None:
+                extra["num_assistant_tokens"] = int(speculative_tokens)
+            if confidence_threshold is not None:
+                extra["assistant_confidence_threshold"] = float(confidence_threshold)
 
         if req.bad_words:
             bad_words_ids = [
@@ -143,6 +197,46 @@ class EagerBackend(BaseBackend):
                 extra["force_words_ids"] = force_words_ids
 
         return extra
+
+    @staticmethod
+    def _extract_unused_model_kwargs(exc: Exception) -> List[str]:
+        text = str(exc)
+        if "not used by the model" not in text:
+            return []
+        lidx = text.find("[")
+        ridx = text.find("]", lidx + 1)
+        if lidx == -1 or ridx == -1:
+            return []
+        payload = text[lidx : ridx + 1]
+        try:
+            parsed = ast.literal_eval(payload)
+        except Exception:
+            return []
+        if isinstance(parsed, list):
+            return [str(x) for x in parsed]
+        return []
+
+    def _generate_with_supported_kwargs(self, inputs: dict, gen_kwargs: dict):
+        """
+        Call `model.generate` while removing unsupported kwargs discovered at runtime.
+        """
+        kwargs = dict(gen_kwargs)
+        for _ in range(3):
+            try:
+                return self._model.generate(**inputs, **kwargs)
+            except ValueError as exc:
+                unused = self._extract_unused_model_kwargs(exc)
+                if not unused:
+                    raise
+                removed = []
+                for key in unused:
+                    if key in kwargs:
+                        kwargs.pop(key, None)
+                        removed.append(key)
+                if not removed:
+                    raise
+                logger.warning("Retrying generation after dropping unsupported kwargs: %s", removed)
+        return self._model.generate(**inputs, **kwargs)
 
     @staticmethod
     def _apply_seed(seed: Optional[int]) -> None:
@@ -210,7 +304,7 @@ class EagerBackend(BaseBackend):
             gen_kwargs["past_key_values"] = past_kv
 
         with torch.inference_mode():
-            outputs = self._model.generate(**inputs, **gen_kwargs)
+            outputs = self._generate_with_supported_kwargs(inputs=inputs, gen_kwargs=gen_kwargs)
 
         t_end = time.monotonic()
         total_ms = (t_end - t_start) * 1000
@@ -269,7 +363,7 @@ class EagerBackend(BaseBackend):
 
         def _generate():
             with torch.inference_mode():
-                self._model.generate(**inputs, **gen_kwargs)
+                self._generate_with_supported_kwargs(inputs=inputs, gen_kwargs=gen_kwargs)
 
         thread = threading.Thread(target=_generate, daemon=True)
         thread.start()

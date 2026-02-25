@@ -3,8 +3,10 @@ llminfer — GPU-Efficient LLM Inference Engine
 
 Features:
   - Quantized weights (4-bit, 8-bit via bitsandbytes)
-  - Dynamic batching and token streaming
-  - KV cache reuse with configurable eviction
+  - Static + continuous batching and token streaming
+  - KV cache reuse with optional paged KV representation
+  - Tensor/pipeline parallel controls (backend dependent)
+  - Speculative decoding controls with assistant models
   - Throughput / latency benchmarking
   - Backend comparison: eager | torch.compile | vllm
 """

@@ -26,7 +26,9 @@ for chunk in engine.stream("Tell me about transformers"):
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import threading
 from typing import Dict, Iterator, List, Optional
 
 from llminfer.backends.base import BaseBackend
@@ -61,6 +63,8 @@ class InferenceEngine:
 
     def load(self) -> "InferenceEngine":
         """Load the model. Returns self for chaining."""
+        if self._backend is not None and self._backend.is_loaded:
+            return self
         self._backend = self._build_backend()
         self._backend.load()
         logger.info(
@@ -105,7 +109,7 @@ class InferenceEngine:
         **kwargs : overrides for GenerationRequest fields
         """
         self._ensure_loaded()
-        req = GenerationRequest(prompt=prompt, **kwargs)
+        req = GenerationRequest(prompt=prompt, **self._with_generation_defaults(kwargs))
         results = self._backend.generate([req])
         return results[0]
 
@@ -115,7 +119,8 @@ class InferenceEngine:
         Automatically splits into batches of max_batch_size.
         """
         self._ensure_loaded()
-        requests = [GenerationRequest(prompt=p, **kwargs) for p in prompts]
+        req_kwargs = self._with_generation_defaults(kwargs)
+        requests = [GenerationRequest(prompt=p, **req_kwargs) for p in prompts]
         results: List[GenerationResult] = []
 
         # Process in chunks of max_batch_size
@@ -133,6 +138,59 @@ class InferenceEngine:
         self._ensure_loaded()
         return self._backend.generate(requests)
 
+    async def run_requests_continuous_async(
+        self,
+        requests: List[GenerationRequest],
+        max_queue_size: Optional[int] = None,
+    ) -> List[GenerationResult]:
+        """
+        Run requests through the continuous-batching scheduler.
+
+        Unlike `run_requests`, requests can keep arriving while prior requests
+        are being processed, emulating serving-style traffic.
+        """
+        if not requests:
+            return []
+        self._ensure_loaded()
+        from llminfer.serving import ContinuousBatchScheduler
+
+        queue_size = max_queue_size or max(1024, len(requests) * 2)
+        scheduler = ContinuousBatchScheduler(
+            engine=self,
+            max_batch_size=self.cfg.max_batch_size,
+            batch_timeout_ms=self.cfg.batch_timeout_ms,
+            max_queue_size=queue_size,
+        )
+        await scheduler.start()
+        try:
+            tasks = [asyncio.create_task(scheduler.submit(req)) for req in requests]
+            return await asyncio.gather(*tasks)
+        finally:
+            await scheduler.stop()
+
+    def run_requests_continuous(
+        self,
+        requests: List[GenerationRequest],
+        max_queue_size: Optional[int] = None,
+    ) -> List[GenerationResult]:
+        """
+        Synchronous wrapper around `run_requests_continuous_async`.
+        """
+        return self._run_async(
+            self.run_requests_continuous_async(
+                requests=requests,
+                max_queue_size=max_queue_size,
+            )
+        )
+
+    def run_batch_continuous(self, prompts: List[str], **kwargs) -> List[GenerationResult]:
+        """
+        Convenience continuous-batching API for homogeneous prompt lists.
+        """
+        req_kwargs = self._with_generation_defaults(kwargs)
+        requests = [GenerationRequest(prompt=p, **req_kwargs) for p in prompts]
+        return self.run_requests_continuous(requests=requests)
+
     def stream(self, prompt: str, **kwargs) -> Iterator[StreamChunk]:
         """
         Stream token-by-token for a single prompt.
@@ -144,7 +202,8 @@ class InferenceEngine:
                 print(chunk.token, end="", flush=True)
         """
         self._ensure_loaded()
-        req = GenerationRequest(prompt=prompt, stream=True, **kwargs)
+        req_kwargs = self._with_generation_defaults(kwargs)
+        req = GenerationRequest(prompt=prompt, stream=True, **req_kwargs)
         return self._backend.stream(req)
 
     # ------------------------------------------------------------------
@@ -161,7 +220,17 @@ class InferenceEngine:
             "quantization": self.cfg.quant.mode.value,
             "assistant_model": self.cfg.assistant_model_name,
             "device": self.cfg.device,
+            "tensor_parallel_size": self.cfg.tensor_parallel_size,
+            "pipeline_parallel_size": self.cfg.pipeline_parallel_size,
             "max_batch_size": self.cfg.max_batch_size,
+            "batch_timeout_ms": self.cfg.batch_timeout_ms,
+            "paged_kv_enabled": self.cfg.cache.enable_paged_kv,
+            "hf_revision": self.cfg.hf_revision,
+            "hf_local_files_only": self.cfg.hf_local_files_only,
+            "compile_fullgraph": self.cfg.compile_fullgraph,
+            "compile_cudagraphs": self.cfg.compile_cudagraphs,
+            "speculative_num_assistant_tokens": self.cfg.speculative_num_assistant_tokens,
+            "speculative_confidence_threshold": self.cfg.speculative_confidence_threshold,
             "loaded": self._backend is not None and self._backend.is_loaded,
         }
 
@@ -199,3 +268,48 @@ class InferenceEngine:
         if self._backend is None or not self._backend.is_loaded:
             logger.info("Auto-loading model...")
             self.load()
+
+    def _with_generation_defaults(self, kwargs: dict) -> dict:
+        merged = dict(kwargs)
+        merged.setdefault("max_new_tokens", self.cfg.max_new_tokens)
+        merged.setdefault("temperature", self.cfg.temperature)
+        merged.setdefault("top_p", self.cfg.top_p)
+        merged.setdefault("top_k", self.cfg.top_k)
+        merged.setdefault("repetition_penalty", self.cfg.repetition_penalty)
+        if self.cfg.speculative_num_assistant_tokens is not None:
+            merged.setdefault(
+                "speculative_num_assistant_tokens",
+                self.cfg.speculative_num_assistant_tokens,
+            )
+        if self.cfg.speculative_confidence_threshold is not None:
+            merged.setdefault(
+                "speculative_confidence_threshold",
+                self.cfg.speculative_confidence_threshold,
+            )
+        return merged
+
+    @staticmethod
+    def _run_async(coro):
+        """
+        Run an async coroutine from sync contexts, including notebook/event-loop
+        environments by hopping to a worker thread when needed.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(coro)
+
+        holder: Dict[str, object] = {"result": None, "error": None}
+
+        def _runner() -> None:
+            try:
+                holder["result"] = asyncio.run(coro)
+            except Exception as exc:  # pragma: no cover - passthrough
+                holder["error"] = exc
+
+        t = threading.Thread(target=_runner, daemon=True)
+        t.start()
+        t.join()
+        if holder["error"] is not None:
+            raise holder["error"]  # type: ignore[misc]
+        return holder["result"]

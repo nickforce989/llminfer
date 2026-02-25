@@ -229,6 +229,7 @@ class Benchmarker:
         warmup_runs: int = 3,
         prompt_type: str = "medium",
         max_new_tokens: int = 128,
+        use_continuous_batching: bool = False,
     ) -> BenchmarkResult:
         """
         Run latency and throughput benchmarks.
@@ -248,13 +249,18 @@ class Benchmarker:
             quant_mode=cfg.quant.mode.value,
             environment=_collect_environment_metadata(),
         )
+        result.environment["continuous_batching"] = use_continuous_batching
 
         prompt = _PROMPTS.get(prompt_type, _PROMPTS["medium"])
         logger.info(
-            "Starting benchmark  backend=%s  batch_sizes=%s  runs=%d",
+            "Starting benchmark  backend=%s  batch_sizes=%s  runs=%d  continuous=%s",
             cfg.backend.value,
             batch_sizes,
             num_runs,
+            use_continuous_batching,
+        )
+        run_batch = (
+            self.engine.run_batch_continuous if use_continuous_batching else self.engine.run_batch
         )
 
         for bs in batch_sizes:
@@ -263,14 +269,14 @@ class Benchmarker:
 
             # Warmup
             for _ in range(warmup_runs):
-                self.engine.run_batch(prompts, max_new_tokens=max_new_tokens)
+                run_batch(prompts, max_new_tokens=max_new_tokens)
             _flush_cuda_cache()
 
             # Timed runs
             metrics = RunMetrics(batch_size=bs, prompt_type=prompt_type)
             for run_idx in range(num_runs):
                 t0 = time.monotonic()
-                results = self.engine.run_batch(prompts, max_new_tokens=max_new_tokens)
+                results = run_batch(prompts, max_new_tokens=max_new_tokens)
                 t1 = time.monotonic()
 
                 latency_ms = (t1 - t0) * 1000
@@ -321,16 +327,43 @@ class BackendComparison:
         model_name: str,
         backends: Optional[List] = None,
         quant_mode=None,
+        hf_revision: Optional[str] = None,
+        hf_token: Optional[str] = None,
+        hf_local_files_only: bool = False,
+        hf_trust_remote_code: bool = True,
+        hf_cache_dir: Optional[str] = None,
+        paged_kv: bool = False,
+        page_size_tokens: int = 16,
+        tensor_parallel_size: int = 1,
+        pipeline_parallel_size: int = 1,
+        compile_fullgraph: bool = False,
+        compile_cudagraphs: bool = True,
+        speculative_num_assistant_tokens: Optional[int] = None,
+        speculative_confidence_threshold: Optional[float] = None,
     ) -> None:
         self.model_name = model_name
         self.backends = backends
         self.quant_mode = quant_mode
+        self.hf_revision = hf_revision
+        self.hf_token = hf_token
+        self.hf_local_files_only = hf_local_files_only
+        self.hf_trust_remote_code = hf_trust_remote_code
+        self.hf_cache_dir = hf_cache_dir
+        self.paged_kv = paged_kv
+        self.page_size_tokens = page_size_tokens
+        self.tensor_parallel_size = tensor_parallel_size
+        self.pipeline_parallel_size = pipeline_parallel_size
+        self.compile_fullgraph = compile_fullgraph
+        self.compile_cudagraphs = compile_cudagraphs
+        self.speculative_num_assistant_tokens = speculative_num_assistant_tokens
+        self.speculative_confidence_threshold = speculative_confidence_threshold
 
     def run(
         self,
         batch_sizes: List[int] = [1, 2, 4, 8],
         num_runs: int = 10,
         max_new_tokens: int = 128,
+        use_continuous_batching: bool = False,
     ) -> List[BenchmarkResult]:
         from llminfer.config import Backend, EngineConfig, QuantConfig, QuantMode
         from llminfer.engine import InferenceEngine
@@ -345,7 +378,21 @@ class BackendComparison:
                 model_name=self.model_name,
                 backend=backend,
                 quant=quant,
+                max_batch_size=max(batch_sizes),
+                hf_revision=self.hf_revision,
+                hf_token=self.hf_token,
+                hf_local_files_only=self.hf_local_files_only,
+                hf_trust_remote_code=self.hf_trust_remote_code,
+                hf_cache_dir=self.hf_cache_dir,
+                tensor_parallel_size=self.tensor_parallel_size,
+                pipeline_parallel_size=self.pipeline_parallel_size,
+                compile_fullgraph=self.compile_fullgraph,
+                compile_cudagraphs=self.compile_cudagraphs,
+                speculative_num_assistant_tokens=self.speculative_num_assistant_tokens,
+                speculative_confidence_threshold=self.speculative_confidence_threshold,
             )
+            cfg.cache.enable_paged_kv = self.paged_kv
+            cfg.cache.page_size_tokens = self.page_size_tokens
             engine = InferenceEngine(cfg)
             engine.load()
 
@@ -354,6 +401,7 @@ class BackendComparison:
                 batch_sizes=batch_sizes,
                 num_runs=num_runs,
                 max_new_tokens=max_new_tokens,
+                use_continuous_batching=use_continuous_batching,
             )
             results.append(result)
             engine.unload()

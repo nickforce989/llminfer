@@ -38,6 +38,8 @@ class CompletionRequest(BaseModel):
     no_repeat_ngram_size: int = 0
     bad_words: Optional[List[str]] = None
     force_words: Optional[List[str]] = None
+    speculative_num_assistant_tokens: Optional[int] = None
+    speculative_confidence_threshold: Optional[float] = None
 
 
 class ChatMessage(BaseModel):
@@ -57,6 +59,8 @@ class ChatCompletionRequest(BaseModel):
     no_repeat_ngram_size: int = 0
     bad_words: Optional[List[str]] = None
     force_words: Optional[List[str]] = None
+    speculative_num_assistant_tokens: Optional[int] = None
+    speculative_confidence_threshold: Optional[float] = None
 
 
 class Metrics:
@@ -144,6 +148,8 @@ def _build_request(
     no_repeat_ngram_size: int,
     bad_words: Optional[List[str]],
     force_words: Optional[List[str]],
+    speculative_num_assistant_tokens: Optional[int],
+    speculative_confidence_threshold: Optional[float],
 ) -> GenerationRequest:
     return GenerationRequest(
         prompt=prompt,
@@ -155,6 +161,8 @@ def _build_request(
         no_repeat_ngram_size=no_repeat_ngram_size,
         bad_words=bad_words,
         force_words=force_words,
+        speculative_num_assistant_tokens=speculative_num_assistant_tokens,
+        speculative_confidence_threshold=speculative_confidence_threshold,
     )
 
 
@@ -249,6 +257,8 @@ def create_openai_app(
                 no_repeat_ngram_size=req.no_repeat_ngram_size,
                 bad_words=req.bad_words,
                 force_words=req.force_words,
+                speculative_num_assistant_tokens=req.speculative_num_assistant_tokens,
+                speculative_confidence_threshold=req.speculative_confidence_threshold,
             )
             result = await nonlocal_scheduler.submit(gen_request)
 
@@ -291,6 +301,8 @@ def create_openai_app(
                 no_repeat_ngram_size=req.no_repeat_ngram_size,
                 bad_words=req.bad_words,
                 force_words=req.force_words,
+                speculative_num_assistant_tokens=req.speculative_num_assistant_tokens,
+                speculative_confidence_threshold=req.speculative_confidence_threshold,
             )
             result = await nonlocal_scheduler.submit(gen_request)
 
@@ -334,6 +346,8 @@ async def _stream_completion(
                 no_repeat_ngram_size=req.no_repeat_ngram_size,
                 bad_words=req.bad_words,
                 force_words=req.force_words,
+                speculative_num_assistant_tokens=req.speculative_num_assistant_tokens,
+                speculative_confidence_threshold=req.speculative_confidence_threshold,
             ):
                 out_q.put(chunk)
         except Exception as exc:  # pragma: no cover - passthrough
@@ -410,6 +424,8 @@ async def _stream_chat_completion(
                 no_repeat_ngram_size=req.no_repeat_ngram_size,
                 bad_words=req.bad_words,
                 force_words=req.force_words,
+                speculative_num_assistant_tokens=req.speculative_num_assistant_tokens,
+                speculative_confidence_threshold=req.speculative_confidence_threshold,
             ):
                 out_q.put(chunk)
         except Exception as exc:  # pragma: no cover - passthrough

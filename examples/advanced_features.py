@@ -24,6 +24,8 @@ def main() -> None:
         model_name=MODEL,
         backend=Backend.EAGER,
         assistant_model_name=ASSISTANT_MODEL,
+        speculative_num_assistant_tokens=8 if ASSISTANT_MODEL else None,
+        speculative_confidence_threshold=0.4 if ASSISTANT_MODEL else None,
         max_batch_size=8,
         batch_timeout_ms=20,
     )

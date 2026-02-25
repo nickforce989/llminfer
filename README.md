@@ -26,6 +26,16 @@ pip install -e ".[peft]"    # LoRA adapter hot-swap
 
 ---
 
+## Colab Notebook Guide
+
+- Start with `examples/llminfer_all_examples_colab.ipynb` for a complete guided tour.
+- Use `examples/llminfer_colab.ipynb` for a fast smoke test.
+- Use `examples/llminfer_advanced_colab.ipynb` for compile/speculative/TP tuning.
+- Use `examples/llminfer_serving_colab.ipynb` for OpenAI-compatible API + SSE.
+- Use `examples/llminfer_readme_colab.ipynb` as a concise README companion.
+
+---
+
 ## Architecture
 
 ```
@@ -52,11 +62,14 @@ pip install -e ".[peft]"    # LoRA adapter hot-swap
 | Feature | Details |
 |---|---|
 | **Quantization** | 4-bit NF4/FP4 (QLoRA), INT8 via bitsandbytes |
-| **KV cache** | Per-sequence cache + prefix cache with LRU eviction |
-| **Batching** | Dynamic batching with configurable timeout |
+| **KV cache** | Per-sequence cache + prefix cache; optional paged KV representation (`page_size_tokens`) |
+| **Batching** | Static batch API + continuous batching scheduler with configurable timeout |
 | **Streaming** | Token-by-token via HF TextIteratorStreamer |
 | **Benchmarking** | Throughput, latency p50/p95/p99, TTFT, GPU memory |
 | **Backends** | PyTorch eager, `torch.compile`, vLLM (optional) |
+| **Parallelism** | Tensor/pipeline parallel knobs (`--tp-size`, `--pp-size`) |
+| **CUDA graphs** | Compile backend exposes cudagraph toggles (`compile_cudagraphs`, step-marking) |
+| **HF loading** | Revision/token/local-files-only/cache-dir/trust-remote-code controls |
 | **Serving API** | OpenAI-compatible `/v1/completions` + `/v1/chat/completions` + SSE |
 | **Artifacts** | Export benchmark/comparison data to JSON + CSV with environment metadata |
 | **Advanced decode** | Stop sequences, no-repeat n-gram, bad/force words, optional speculative decoding |
@@ -103,6 +116,74 @@ key = KVCacheManager.hash_prefix(sys_prompt)
 r1 = engine.run(sys_prompt + "\n\nUser: What is BERT?",  prefix_key=key)  # miss
 r2 = engine.run(sys_prompt + "\n\nUser: What is GPT-2?", prefix_key=key)  # hit ✓
 print(f"Cache hit: {r2.stats.cache_hit}")
+```
+
+---
+
+## HF Weight Loading Controls
+
+You can load a specific Hugging Face revision, use private/gated models with a
+token, force local-only loading, and pin the cache directory.
+
+```python
+cfg = EngineConfig(
+    model_name="meta-llama/Llama-3.2-1B-Instruct",
+    hf_revision="main",          # branch/tag/commit
+    hf_token=None,               # or "hf_xxx" for gated models
+    hf_local_files_only=False,   # True = do not hit network
+    hf_cache_dir="./hf-cache",
+    hf_trust_remote_code=True,
+)
+engine = InferenceEngine(cfg).load()
+```
+
+CLI:
+
+```bash
+llminfer run "Explain tensor parallelism." \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --revision main \
+  --cache-dir ./hf-cache \
+  --hf-token "$HF_TOKEN"
+```
+
+---
+
+## Paged KV Cache And Continuous Batching
+
+For serving-like traffic, you can:
+- represent cached KV tensors in fixed-size pages (`enable_paged_kv`),
+- process requests with the continuous-batching scheduler.
+
+```python
+cfg = EngineConfig(
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    max_batch_size=16,
+    batch_timeout_ms=20,
+)
+cfg.cache.enable_paged_kv = True
+cfg.cache.page_size_tokens = 16
+
+engine = InferenceEngine(cfg).load()
+results = engine.run_batch_continuous(
+    ["Give me 3 GPU facts.", "Explain KV cache briefly."],
+    max_new_tokens=96,
+    temperature=0.2,
+)
+for r in results:
+    print(r.generated_text)
+```
+
+CLI:
+
+```bash
+llminfer bench \
+  --model facebook/opt-125m \
+  --batch-sizes 1,2,4,8 \
+  --runs 5 \
+  --continuous \
+  --paged-kv \
+  --page-size-tokens 16
 ```
 
 ---
@@ -159,12 +240,25 @@ engine = InferenceEngine(cfg).load()
 print(engine.run("What is speculative decoding?", max_new_tokens=96, temperature=0.2).generated_text)
 ```
 
+Advanced speculative knobs:
+
+```python
+cfg = EngineConfig(
+    model_name="Qwen/Qwen2.5-1.5B-Instruct",
+    assistant_model_name="Qwen/Qwen2.5-0.5B-Instruct",
+    speculative_num_assistant_tokens=8,
+    speculative_confidence_threshold=0.4,
+)
+```
+
 CLI:
 
 ```bash
 llminfer run "What is speculative decoding?" \
   --model Qwen/Qwen2.5-1.5B-Instruct \
   --assistant-model Qwen/Qwen2.5-0.5B-Instruct \
+  --spec-num-assistant-tokens 8 \
+  --spec-confidence-threshold 0.4 \
   --temp 0.2
 ```
 
@@ -245,7 +339,7 @@ Comparison benchmark:
 ```bash
 llminfer compare \
   --model facebook/opt-125m \
-  --backends eager,compiled \
+  --backends eager,compiled,vllm \
   --batch-sizes 1,2,4 \
   --runs 5 \
   --artifacts-dir benchmarks/compare_out
@@ -256,6 +350,17 @@ Outputs:
 - `benchmarks/compare_out/comparison.csv`
 
 You can also write explicit paths with `--json-out` and `--csv-out`.
+
+Dedicated eager-vs-vLLM script:
+
+```bash
+python examples/benchmark_vs_vllm.py \
+  --model facebook/opt-125m \
+  --batch-sizes 1,2,4,8 \
+  --runs 5 \
+  --continuous \
+  --outdir benchmarks/vllm_compare
+```
 
 Additional plotting outputs:
 
@@ -274,6 +379,20 @@ Each plot suite writes:
 ---
 
 ## Backend Comparison
+
+Tensor/pipeline parallel knobs can be applied during compare runs, especially
+for vLLM:
+
+```bash
+llminfer compare \
+  --model meta-llama/Llama-3.2-1B-Instruct \
+  --backends eager,vllm \
+  --tp-size 2 \
+  --pp-size 1 \
+  --compile-cudagraphs \
+  --batch-sizes 1,2,4,8 \
+  --runs 5
+```
 
 ```python
 from llminfer.benchmark import BackendComparison
@@ -315,14 +434,21 @@ llminfer stream "Explain backpropagation" --model facebook/opt-1.3b --quant nf4
 # Benchmark
 llminfer bench --model facebook/opt-125m --batch-sizes 1,2,4,8 --runs 10 --plot bench.png
 
-# Benchmark + full plot suite
-llminfer bench --model facebook/opt-125m --batch-sizes 1,2,4,8 --runs 10 --plot-suite-dir plots/bench
+# Benchmark + continuous batching + paged KV
+llminfer bench \
+  --model facebook/opt-125m \
+  --batch-sizes 1,2,4,8 \
+  --runs 10 \
+  --continuous \
+  --paged-kv \
+  --page-size-tokens 16 \
+  --plot-suite-dir plots/bench
 
 # Compare backends
-llminfer compare --model facebook/opt-125m --backends eager,compiled --plot compare.png
+llminfer compare --model facebook/opt-125m --backends eager,compiled,vllm --plot compare.png
 
 # Compare backends + full plot suite
-llminfer compare --model facebook/opt-125m --backends eager,compiled --plot-suite-dir plots/compare
+llminfer compare --model facebook/opt-125m --backends eager,vllm --continuous --plot-suite-dir plots/compare
 
 # Run OpenAI-compatible server
 llminfer serve --model Qwen/Qwen2.5-1.5B-Instruct --host 0.0.0.0 --port 8000
@@ -501,7 +627,7 @@ llminfer/
 ├── config.py            EngineConfig, QuantConfig, CacheConfig
 ├── engine.py            InferenceEngine (main entrypoint)
 ├── request.py           GenerationRequest, GenerationResult, StreamChunk
-├── kv_cache.py          KVCacheManager with prefix cache + LRU eviction
+├── kv_cache.py          KVCacheManager with prefix cache + optional paged KV layout
 ├── batching.py          Dynamic batch assembly (sync + async)
 ├── streaming.py         TokenStreamer wrapping HF TextIteratorStreamer
 ├── benchmark.py         Benchmarker + BackendComparison + artifact export
@@ -516,14 +642,16 @@ llminfer/
 ```
 
 examples/
-├── full_demo.py                 Original end-to-end walkthrough
-├── advanced_features.py         Constraints, speculative setup, artifacts, adapters
-├── run_server.py                Launch OpenAI-compatible server
-├── openai_api_client.py         Non-stream + stream API client examples
-├── llminfer_colab.ipynb         Quick Colab setup and smoke tests
-├── llminfer_readme_colab.ipynb  README-equivalent Colab walkthrough
-├── llminfer_advanced_colab.ipynb Advanced features Colab notebook
-└── llminfer_serving_colab.ipynb  Serving/API Colab notebook
+├── full_demo.py                     Original end-to-end walkthrough
+├── advanced_features.py             Constraints, speculative setup, artifacts, adapters
+├── benchmark_vs_vllm.py             Focused eager-vs-vLLM benchmark/export script
+├── run_server.py                    Launch OpenAI-compatible server
+├── openai_api_client.py             Non-stream + stream API client examples
+├── llminfer_all_examples_colab.ipynb Master Colab that covers all example paths
+├── llminfer_colab.ipynb             Quickstart notebook
+├── llminfer_readme_colab.ipynb      Concise README companion notebook
+├── llminfer_advanced_colab.ipynb    Advanced tuning notebook
+└── llminfer_serving_colab.ipynb     Serving/API notebook
 
 ## Examples and Colab Notebooks
 
@@ -539,6 +667,11 @@ examples/
   - Shows optional PEFT adapter workflow.
   - Exports benchmark artifacts (`benchmark.json`, `benchmark.csv`, `benchmark.png`).
 
+- `examples/benchmark_vs_vllm.py`
+  - Compares eager and vLLM backends with the same model/prompts.
+  - Supports HF loading flags, continuous batching, and paged-KV toggles.
+  - Exports JSON/CSV plus dashboard and per-metric plots.
+
 - `examples/run_server.py`
   - Starts OpenAI-compatible API with `ContinuousBatchScheduler`.
   - Intended as a minimal serving bootstrap script.
@@ -549,18 +682,32 @@ examples/
 
 ### Colab notebooks
 
+The notebooks are intentionally de-duplicated so each has a distinct job:
+
+- `examples/llminfer_all_examples_colab.ipynb`
+  - End-to-end master notebook covering all example scripts/workflows.
+  - Includes clear section headers, explicit prints, artifact exports, and plot displays.
+
 - `examples/llminfer_colab.ipynb`
-  - Fast setup + smoke tests.
+  - Minimal quickstart: install, run, stream, static vs continuous batching, benchmark plots.
 
 - `examples/llminfer_readme_colab.ipynb`
-  - Full README walkthrough in notebook form.
+  - Concise runnable companion to README sections.
+  - Links out to specialized notebooks instead of duplicating all steps.
 
 - `examples/llminfer_advanced_colab.ipynb`
-  - Advanced controls, artifact export, compare workflows, optional adapter flow.
+  - Advanced controls: HF loading flags, speculative knobs, compile/cudagraph toggles,
+    continuous batching, artifact suite, optional vLLM compare.
 
 - `examples/llminfer_serving_colab.ipynb`
-  - Runs API server inside Colab.
-  - Exercises `/v1/chat/completions` (non-stream + stream) plus `/healthz` and `/metrics`.
+  - OpenAI-compatible server workflow with robust startup checks.
+  - Non-streaming + robust SSE streaming parser, concurrency smoke test, metrics checks.
+
+Notebook quality conventions:
+- clean cells (no stale output blobs committed),
+- explicit print summaries for each section,
+- saved plots rendered inline from generated artifacts,
+- optional heavy sections (`RUN_VLLM`, etc.) gated with clear flags.
 
 ---
 
@@ -570,6 +717,8 @@ examples/
 HuggingFace manages KV cache internally per `generate()` call. Our
 `KVCacheManager` adds *prefix-level* caching across calls — identical
 system prompts don't re-compute their KV blocks on the second request.
+It can also represent cached KV in fixed-size pages to reduce memory
+fragmentation pressure in long-running processes.
 
 **Why dynamic batching?**  
 Static batching wastes GPU time waiting for the slowest sequence.

@@ -55,10 +55,14 @@ class CompiledBackend(EagerBackend):
             )
             return
 
+        self._configure_inductor()
+
         logger.info(
-            "Compiling model  mode=%s  dynamic=%s",
+            "Compiling model  mode=%s  dynamic=%s  fullgraph=%s  cudagraphs=%s",
             self.cfg.compile_mode,
             self.cfg.compile_dynamic,
+            self.cfg.compile_fullgraph,
+            self.cfg.compile_cudagraphs,
         )
         t0 = time.monotonic()
         self._original_forward = self._model.forward
@@ -69,7 +73,7 @@ class CompiledBackend(EagerBackend):
                 self._model.forward,
                 mode=self.cfg.compile_mode,
                 dynamic=self.cfg.compile_dynamic,
-                fullgraph=False,   # safer for most models
+                fullgraph=self.cfg.compile_fullgraph,
             )
         except Exception:
             logger.exception("torch.compile setup failed; using eager forward path.")
@@ -78,6 +82,25 @@ class CompiledBackend(EagerBackend):
         self._compiled = True
 
         logger.info("Compilation setup done in %.2fs  (first call will trigger JIT)", time.monotonic() - t0)
+
+    def _configure_inductor(self) -> None:
+        """
+        Configure inductor cudagraph behavior, if exposed by this torch build.
+        """
+        try:
+            import torch._inductor.config as inductor_config
+        except Exception:
+            return
+        try:
+            triton_cfg = getattr(inductor_config, "triton", None)
+            if triton_cfg is None:
+                return
+            if hasattr(triton_cfg, "cudagraphs"):
+                triton_cfg.cudagraphs = bool(self.cfg.compile_cudagraphs)
+            if hasattr(triton_cfg, "cudagraph_trees"):
+                triton_cfg.cudagraph_trees = bool(self.cfg.compile_cudagraphs)
+        except Exception:
+            logger.debug("Could not apply inductor cudagraph config", exc_info=True)
 
     def _mark_cudagraph_step(self) -> None:
         """

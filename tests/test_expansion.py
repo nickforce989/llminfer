@@ -2,6 +2,7 @@ import asyncio
 import json
 
 from llminfer.benchmark import (
+    Benchmarker,
     BenchmarkResult,
     RunMetrics,
     save_comparison_csv,
@@ -10,6 +11,8 @@ from llminfer.benchmark import (
     save_plot_suite,
 )
 from llminfer.backends.compiled import CompiledBackend
+from llminfer.backends.eager import EagerBackend
+from llminfer.config import EngineConfig
 from llminfer.request import GenerationRequest, GenerationResult, TokenStats
 from llminfer.serving import ContinuousBatchScheduler, chat_messages_to_prompt
 
@@ -150,3 +153,78 @@ def test_compiled_error_detection_helper():
     err = RuntimeError("Error: accessing tensor output of CUDAGraphs that has been overwritten")
     assert CompiledBackend._looks_like_compile_runtime_error(err)
     assert not CompiledBackend._looks_like_compile_runtime_error(RuntimeError("plain error"))
+
+
+def test_eager_extract_unused_model_kwargs():
+    keys = EagerBackend._extract_unused_model_kwargs(
+        ValueError("The following `model_kwargs` are not used by the model: ['a', 'b']")
+    )
+    assert keys == ["a", "b"]
+    assert EagerBackend._extract_unused_model_kwargs(ValueError("other")) == []
+
+
+def test_eager_generate_retries_dropping_unsupported_kwargs():
+    backend = EagerBackend(EngineConfig())
+
+    class _DummyModel:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                raise ValueError(
+                    "The following `model_kwargs` are not used by the model: ['num_assistant_tokens']"
+                )
+            return "ok"
+
+    backend._model = _DummyModel()
+    out = backend._generate_with_supported_kwargs(
+        inputs={"input_ids": "x"},
+        gen_kwargs={"num_assistant_tokens": 8, "temperature": 0.2},
+    )
+    assert out == "ok"
+    assert backend._model.calls == 2
+
+
+def test_benchmarker_can_use_continuous_batching():
+    class _BenchEngine:
+        def __init__(self):
+            self.cfg = type(
+                "Cfg",
+                (),
+                {
+                    "backend": type("B", (), {"value": "eager"})(),
+                    "model_name": "dummy-model",
+                    "quant": type("Q", (), {"mode": type("M", (), {"value": "none"})()})(),
+                },
+            )()
+            self.called_run_batch = 0
+            self.called_run_batch_cont = 0
+
+        def run_batch(self, prompts, max_new_tokens=128):
+            self.called_run_batch += 1
+            return [
+                GenerationResult(
+                    request_id=f"id-{i}",
+                    prompt=p,
+                    generated_text="ok",
+                    stats=TokenStats(generated_tokens=4, total_latency_ms=1),
+                )
+                for i, p in enumerate(prompts)
+            ]
+
+        def run_batch_continuous(self, prompts, max_new_tokens=128):
+            self.called_run_batch_cont += 1
+            return self.run_batch(prompts, max_new_tokens=max_new_tokens)
+
+    engine = _BenchEngine()
+    bm = Benchmarker(engine)
+    bm.run(
+        batch_sizes=[1],
+        num_runs=1,
+        warmup_runs=1,
+        max_new_tokens=8,
+        use_continuous_batching=True,
+    )
+    assert engine.called_run_batch_cont > 0

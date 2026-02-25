@@ -27,6 +27,9 @@ class GenerationRequest:
     bad_words: Optional[List[str]] = None
     force_words: Optional[List[str]] = None
     prefix_allowed_tokens_fn: Optional[Callable[[int, Any], List[int]]] = None
+    # Speculative decoding knobs (backend support varies).
+    speculative_num_assistant_tokens: Optional[int] = None
+    speculative_confidence_threshold: Optional[float] = None
     # Optional RNG seed for reproducible sampling.
     seed: Optional[int] = None
     # Attach a prefix cache key to reuse KV blocks (e.g. system prompt hash)
