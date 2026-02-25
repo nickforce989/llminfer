@@ -5,8 +5,13 @@ setup(
     version="0.1.0",
     description="GPU-Efficient LLM Inference Engine with quantization, KV cache, batching, and benchmarking",
     author="Your Name",
+    license="GPL-3.0-or-later",
     packages=find_packages(),
     python_requires=">=3.9",
+    classifiers=[
+        "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+        "Programming Language :: Python :: 3",
+    ],
     install_requires=[
         "torch>=2.1.0",
         "transformers>=4.35.0",

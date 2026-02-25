@@ -495,3 +495,10 @@ dispatching, trading a small fixed latency for much higher throughput.
 - `vllm` for the VLLM backend (Linux + CUDA only)
 - `fastapi` + `uvicorn` + `prometheus-client` for `llminfer serve`
 - `peft` for LoRA adapter hot-swap
+
+---
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 or later
+(GPL-3.0-or-later). See the [LICENSE](LICENSE) file.
