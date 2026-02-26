@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 
 from llminfer.benchmark import (
     Benchmarker,
@@ -80,6 +81,52 @@ def test_continuous_batch_scheduler_groups_requests():
     assert len(engine.calls) == 2
     assert len(engine.calls[0]) == 2
     assert len(engine.calls[1]) == 1
+
+
+def test_continuous_batch_scheduler_uses_stable_executor_thread():
+    class _ThreadAwareEngine:
+        def __init__(self):
+            self.thread_ids = []
+            self.loaded = False
+
+        def load(self):
+            self.loaded = True
+
+        def unload(self):
+            self.loaded = False
+
+        def run_requests(self, requests):
+            self.thread_ids.append(threading.get_ident())
+            out = []
+            for req in requests:
+                out.append(
+                    GenerationResult(
+                        request_id=req.request_id,
+                        prompt=req.prompt,
+                        generated_text="ok",
+                        stats=TokenStats(prompt_tokens=1, generated_tokens=1, total_latency_ms=1),
+                    )
+                )
+            return out
+
+    async def _run():
+        engine = _ThreadAwareEngine()
+        scheduler = ContinuousBatchScheduler(
+            engine=engine,
+            max_batch_size=2,
+            batch_timeout_ms=200,
+            max_queue_size=16,
+        )
+        await scheduler.start()
+        reqs = [GenerationRequest(prompt=f"p{i}") for i in range(4)]
+        await asyncio.gather(*(scheduler.submit(r) for r in reqs))
+        await scheduler.stop()
+        return engine
+
+    engine = asyncio.run(_run())
+    # Four requests with batch_size=2 => two backend calls.
+    assert len(engine.thread_ids) >= 2
+    assert len(set(engine.thread_ids)) == 1
 
 
 def test_benchmark_artifact_exports(tmp_path):

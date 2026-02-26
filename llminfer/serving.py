@@ -8,6 +8,7 @@ InferenceEngine for production-style request coalescing.
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 import time
 from dataclasses import dataclass
 from typing import List, Optional
@@ -59,12 +60,22 @@ class ContinuousBatchScheduler:
         self._queue: asyncio.Queue[QueuedRequest] = asyncio.Queue(maxsize=max_queue_size)
         self._stop_event = asyncio.Event()
         self._worker_task: Optional[asyncio.Task] = None
+        # Keep model execution on a stable worker thread. This avoids some
+        # torch.compile/cudagraph TLS issues when hopping across thread-pool threads.
+        self._executor: Optional[ThreadPoolExecutor] = None
 
     async def start(self) -> None:
         if self._worker_task is not None and not self._worker_task.done():
             return
 
-        await asyncio.to_thread(self.engine.load)
+        if self._executor is None:
+            self._executor = ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix="llminfer-batch-exec",
+            )
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.engine.load)
         self._stop_event.clear()
         self._worker_task = asyncio.create_task(self._worker_loop(), name="llminfer-batch-worker")
 
@@ -78,6 +89,9 @@ class ContinuousBatchScheduler:
         except asyncio.CancelledError:
             pass
         self._worker_task = None
+        if self._executor is not None:
+            self._executor.shutdown(wait=True, cancel_futures=False)
+            self._executor = None
 
     async def submit(self, request: GenerationRequest) -> GenerationResult:
         if self._worker_task is None or self._worker_task.done():
@@ -116,7 +130,13 @@ class ContinuousBatchScheduler:
 
             requests = [item.request for item in batch]
             try:
-                results = await asyncio.to_thread(self.engine.run_requests, requests)
+                loop = asyncio.get_running_loop()
+                if self._executor is None:
+                    self._executor = ThreadPoolExecutor(
+                        max_workers=1,
+                        thread_name_prefix="llminfer-batch-exec",
+                    )
+                results = await loop.run_in_executor(self._executor, self.engine.run_requests, requests)
                 result_map = {r.request_id: r for r in results}
                 for item in batch:
                     if item.future.done():

@@ -703,6 +703,7 @@ The notebooks are intentionally de-duplicated so each has a distinct job:
 - `examples/llminfer_advanced_colab.ipynb`
   - Advanced controls: HF loading flags, speculative knobs, compile/cudagraph toggles,
     continuous batching, artifact suite, optional vLLM compare.
+  - Includes vLLM install/import checks and guidance for torch/vLLM ABI mismatch in Colab.
 
 - `examples/llminfer_serving_colab.ipynb`
   - OpenAI-compatible server workflow with robust startup checks.
@@ -713,6 +714,11 @@ Notebook quality conventions:
 - explicit print summaries for each section,
 - saved plots rendered inline from generated artifacts,
 - optional heavy sections (`RUN_VLLM`, etc.) gated with clear flags.
+
+vLLM note for Colab:
+- If you see an import error with `undefined symbol ... _C.abi3.so`, your runtime
+  has a torch/vLLM binary mismatch. Restart the runtime, rerun install cells, and
+  use the notebook's vLLM section (it force-refreshes vLLM and validates import).
 
 ---
 

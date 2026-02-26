@@ -49,12 +49,24 @@ class VLLMBackend(BaseBackend):
     def load(self) -> None:
         try:
             from vllm import AsyncEngineArgs, AsyncLLMEngine
-        except ImportError:
+        except ImportError as exc:
+            msg = str(exc)
+            if "undefined symbol" in msg or "_C.abi3.so" in msg:
+                raise ImportError(
+                    "vLLM import failed due to a torch/vLLM binary mismatch "
+                    "(C++/CUDA ABI mismatch). This often happens on Colab when "
+                    "vLLM wheels and the preinstalled torch build are incompatible.\n"
+                    "Recommended fix in a fresh runtime:\n"
+                    "  pip uninstall -y vllm\n"
+                    "  pip install --upgrade --force-reinstall --no-cache-dir vllm\n"
+                    "If it still fails, reinstall torch + vllm from matching CUDA wheels.\n"
+                    f"Original error: {msg}"
+                ) from exc
             raise ImportError(
                 "vLLM is not installed. Install it with:\n"
                 "  pip install vllm\n"
                 "Note: vLLM requires CUDA and Linux."
-            )
+            ) from exc
 
         logger.info("Loading vLLM engine  model=%s", self.cfg.model_name)
 
